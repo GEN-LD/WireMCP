@@ -1,17 +1,73 @@
 // index.js - WireMCP Server
 const axios = require('axios');
-const { exec } = require('child_process');
+// 【安全修复】将 exec 替换为 execFile，避免用户输入通过系统 shell 执行，从根本上消除命令注入风险
+// exec 会将命令字符串传给 /bin/sh 执行，攻击者可通过 shell 元字符（;、&&、| 等）注入任意命令
+// execFile 直接调用目标程序，参数以数组形式传递，不经过 shell 解析，彻底阻断注入路径
+const { execFile } = require('child_process');
 const { promisify } = require('util');
 const which = require('which');
 const fs = require('fs').promises;
-const execAsync = promisify(exec);
+const crypto = require('crypto');
+const path = require('path');
+const os = require('os');
+// 【安全修复】将 promisify 的底层从 exec 改为 execFile，保证所有调用点使用安全的参数传递方式
+const execFileAsync = promisify(execFile);
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
+const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod');
+const express = require('express');
 
 // Redirect console.log to stderr
 const originalConsoleLog = console.log;
 console.log = (...args) => console.error(...args);
+
+// 【安全修复】输入白名单校验函数，防止攻击者通过恶意输入构造 shell 注入载荷
+// 在所有使用用户输入调用系统命令之前，必须先经过这些校验函数
+
+/**
+ * 校验网络接口名称
+ * 仅允许字母、数字、下划线、连字符、点号，长度不超过 64 字符
+ * 阻止如 "eth0; whoami" 这类包含 shell 元字符的注入尝试
+ */
+function validateInterface(name) {
+  if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(name)) {
+    throw new Error(`非法的网络接口名称: "${name}"。仅允许字母、数字、下划线、连字符和点号。`);
+  }
+  return name;
+}
+
+/**
+ * 校验捕获时长
+ * 仅允许 1~60 之间的整数，防止注入如 "5; cat /etc/passwd" 的非数字字符串
+ */
+function validateDuration(d) {
+  if (!Number.isInteger(d) || d < 1 || d > 60) {
+    throw new Error(`捕获时长必须是 1~60 之间的整数，当前值: ${d}`);
+  }
+  return d;
+}
+
+/**
+ * 校验 pcap 文件路径
+ * 规范化为绝对路径，禁止路径穿越（包含 ".."），并检查文件是否存在
+ */
+async function validatePcapPath(p) {
+  if (typeof p !== 'string' || p.includes('..') || p.includes('\0')) {
+    throw new Error(`非法的文件路径: "${p}"。路径中不允许包含 ".." 或空字符。`);
+  }
+  const resolved = path.resolve(p);
+  await fs.access(resolved);
+  return resolved;
+}
+
+/**
+ * 生成安全的临时文件路径
+ * 使用 os.tmpdir() + 唯一文件名，避免硬编码文件名被猜到或产生冲突
+ */
+function createTempPcapPath() {
+  return path.join(os.tmpdir(), `wiremcp_${crypto.randomUUID()}.pcap`);
+}
 
 // Dynamically locate tshark
 async function findTshark() {
@@ -25,11 +81,12 @@ async function findTshark() {
       ? ['C:\\Program Files\\Wireshark\\tshark.exe', 'C:\\Program Files (x86)\\Wireshark\\tshark.exe']
       : ['/usr/bin/tshark', '/usr/local/bin/tshark', '/opt/homebrew/bin/tshark', '/Applications/Wireshark.app/Contents/MacOS/tshark'];
     
-    for (const path of fallbacks) {
+    for (const candidate of fallbacks) {
       try {
-        await execAsync(`${path} -v`);
-        console.error(`Found tshark at fallback: ${path}`);
-        return path;
+        // 【安全修复】使用 execFileAsync 替代 execAsync，避免 tshark 路径拼接字符串经过 shell 解析
+        await execFileAsync(candidate, ['-v']);
+        console.error(`Found tshark at fallback: ${candidate}`);
+        return candidate;
       } catch (e) {
         console.error(`Fallback ${path} failed: ${e.message}`);
       }
@@ -38,14 +95,10 @@ async function findTshark() {
   }
 }
 
-// Initialize MCP server
-const server = new McpServer({
-  name: 'wiremcp',
-  version: '1.0.0',
-});
-
-// Tool 1: Capture live packet data
-server.tool(
+// Register tools with the given server instance
+function registerTools(server) {
+  // Tool 1: Capture live packet data
+  server.tool(
   'capture_packets',
   'Capture live traffic and provide raw packet data as JSON for LLM analysis',
   {
@@ -56,16 +109,24 @@ server.tool(
     try {
       const tsharkPath = await findTshark();
       const { interface, duration } = args;
-      const tempPcap = 'temp_capture.pcap';
+      // 【安全修复】对用户输入的 interface 和 duration 进行白名单校验，阻止 shell 注入
+      validateInterface(interface);
+      validateDuration(duration);
+      // 【安全修复】使用安全的临时文件路径，避免硬编码文件名被利用
+      const tempPcap = createTempPcapPath();
       console.error(`Capturing packets on ${interface} for ${duration}s`);
 
-      await execAsync(
-        `${tsharkPath} -i ${interface} -w ${tempPcap} -a duration:${duration}`,
+      // 【安全修复】使用 execFileAsync + 参数数组替代 execAsync + 字符串拼接
+      // execFile 不经过系统 shell，参数直接传递给 tshark 进程，阻断注入路径
+      await execFileAsync(
+        tsharkPath,
+        ['-i', interface, '-w', tempPcap, '-a', `duration:${duration}`],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
 
-      const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${tempPcap}" -T json -e frame.number -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e tcp.flags -e frame.time -e http.request.method -e http.response.code`,
+      const { stdout, stderr } = await execFileAsync(
+        tsharkPath,
+        ['-r', tempPcap, '-T', 'json', '-e', 'frame.number', '-e', 'ip.src', '-e', 'ip.dst', '-e', 'tcp.srcport', '-e', 'tcp.dstport', '-e', 'tcp.flags', '-e', 'frame.time', '-e', 'http.request.method', '-e', 'http.response.code'],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
       if (stderr) console.error(`tshark stderr: ${stderr}`);
@@ -108,16 +169,22 @@ server.tool(
     try {
       const tsharkPath = await findTshark();
       const { interface, duration } = args;
-      const tempPcap = 'temp_capture.pcap';
+      // 【安全修复】白名单校验用户输入，防止命令注入
+      validateInterface(interface);
+      validateDuration(duration);
+      const tempPcap = createTempPcapPath();
       console.error(`Capturing summary stats on ${interface} for ${duration}s`);
 
-      await execAsync(
-        `${tsharkPath} -i ${interface} -w ${tempPcap} -a duration:${duration}`,
+      // 【安全修复】使用 execFileAsync 参数数组方式调用，绕过 shell 解析
+      await execFileAsync(
+        tsharkPath,
+        ['-i', interface, '-w', tempPcap, '-a', `duration:${duration}`],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
 
-      const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${tempPcap}" -qz io,phs`,
+      const { stdout, stderr } = await execFileAsync(
+        tsharkPath,
+        ['-r', tempPcap, '-qz', 'io,phs'],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
       if (stderr) console.error(`tshark stderr: ${stderr}`);
@@ -149,16 +216,22 @@ server.tool(
     try {
       const tsharkPath = await findTshark();
       const { interface, duration } = args;
-      const tempPcap = 'temp_capture.pcap';
+      // 【安全修复】白名单校验用户输入，防止命令注入
+      validateInterface(interface);
+      validateDuration(duration);
+      const tempPcap = createTempPcapPath();
       console.error(`Capturing conversations on ${interface} for ${duration}s`);
 
-      await execAsync(
-        `${tsharkPath} -i ${interface} -w ${tempPcap} -a duration:${duration}`,
+      // 【安全修复】使用 execFileAsync 参数数组方式调用，绕过 shell 解析
+      await execFileAsync(
+        tsharkPath,
+        ['-i', interface, '-w', tempPcap, '-a', `duration:${duration}`],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
 
-      const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${tempPcap}" -qz conv,tcp`,
+      const { stdout, stderr } = await execFileAsync(
+        tsharkPath,
+        ['-r', tempPcap, '-qz', 'conv,tcp'],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
       if (stderr) console.error(`tshark stderr: ${stderr}`);
@@ -190,16 +263,22 @@ server.tool(
     try {
       const tsharkPath = await findTshark();
       const { interface, duration } = args;
-      const tempPcap = 'temp_capture.pcap';
+      // 【安全修复】白名单校验用户输入，防止命令注入
+      validateInterface(interface);
+      validateDuration(duration);
+      const tempPcap = createTempPcapPath();
       console.error(`Capturing traffic on ${interface} for ${duration}s to check threats`);
 
-      await execAsync(
-        `${tsharkPath} -i ${interface} -w ${tempPcap} -a duration:${duration}`,
+      // 【安全修复】使用 execFileAsync 参数数组方式调用，绕过 shell 解析
+      await execFileAsync(
+        tsharkPath,
+        ['-i', interface, '-w', tempPcap, '-a', `duration:${duration}`],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
 
-      const { stdout } = await execAsync(
-        `${tsharkPath} -r "${tempPcap}" -T fields -e ip.src -e ip.dst`,
+      const { stdout } = await execFileAsync(
+        tsharkPath,
+        ['-r', tempPcap, '-T', 'fields', '-e', 'ip.src', '-e', 'ip.dst'],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
       const ips = [...new Set(stdout.split('\n').flatMap(line => line.split('\t')).filter(ip => ip && ip !== 'unknown'))];
@@ -310,12 +389,13 @@ server.tool(
       const { pcapPath } = args;
       console.error(`Analyzing PCAP file: ${pcapPath}`);
 
-      // Check if file exists
-      await fs.access(pcapPath);
+      // 【安全修复】使用 validatePcapPath 替代 fs.access，一并完成路径规范化、安全检查和存在性验证
+      const safePcapPath = await validatePcapPath(pcapPath);
 
-      // Extract broad packet data
-      const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${pcapPath}" -T json -e frame.number -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e udp.srcport -e udp.dstport -e http.host -e http.request.uri -e frame.protocols`,
+      // 【安全修复】使用 execFileAsync + 参数数组，pcapPath 作为独立参数传入，不经过 shell
+      const { stdout, stderr } = await execFileAsync(
+        tsharkPath,
+        ['-r', safePcapPath, '-T', 'json', '-e', 'frame.number', '-e', 'ip.src', '-e', 'ip.dst', '-e', 'tcp.srcport', '-e', 'tcp.dstport', '-e', 'udp.srcport', '-e', 'udp.dstport', '-e', 'http.host', '-e', 'http.request.uri', '-e', 'frame.protocols'],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
       if (stderr) console.error(`tshark stderr: ${stderr}`);
@@ -374,17 +454,20 @@ server.tool(
         const { pcapPath } = args;
         console.error(`Extracting credentials from PCAP file: ${pcapPath}`);
   
-        await fs.access(pcapPath);
+        // 【安全修复】使用 validatePcapPath 替代 fs.access，一并完成路径规范化、安全检查和存在性验证
+        const safePcapPath = await validatePcapPath(pcapPath);
   
-        // Extract plaintext credentials
-        const { stdout: plaintextOut } = await execAsync(
-          `${tsharkPath} -r "${pcapPath}" -T fields -e http.authbasic -e ftp.request.command -e ftp.request.arg -e telnet.data -e frame.number`,
+        // 【安全修复】使用 execFileAsync + 参数数组，pcapPath 作为独立参数传入，不经过 shell
+        const { stdout: plaintextOut } = await execFileAsync(
+          tsharkPath,
+          ['-r', safePcapPath, '-T', 'fields', '-e', 'http.authbasic', '-e', 'ftp.request.command', '-e', 'ftp.request.arg', '-e', 'telnet.data', '-e', 'frame.number'],
           { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
         );
 
-        // Extract Kerberos credentials
-        const { stdout: kerberosOut } = await execAsync(
-          `${tsharkPath} -r "${pcapPath}" -T fields -e kerberos.CNameString -e kerberos.realm -e kerberos.cipher -e kerberos.type -e kerberos.msg_type -e frame.number`,
+        // 【安全修复】同上，使用 execFileAsync 参数数组方式提取 Kerberos 凭据
+        const { stdout: kerberosOut } = await execFileAsync(
+          tsharkPath,
+          ['-r', safePcapPath, '-T', 'fields', '-e', 'kerberos.CNameString', '-e', 'kerberos.realm', '-e', 'kerberos.cipher', '-e', 'kerberos.type', '-e', 'kerberos.msg_type', '-e', 'frame.number'],
           { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
         );
 
@@ -507,9 +590,12 @@ server.tool(
       }
     }
   );
+}
 
-// Add prompts for each tool
-server.prompt(
+// Register prompts with the given server instance
+function registerPrompts(server) {
+  // Add prompts for each tool
+  server.prompt(
   'capture_packets_prompt',
   {
     interface: z.string().optional().describe('Network interface to capture from'),
@@ -653,11 +739,51 @@ server.prompt(
     }]
   })
 );
+}
 
-// Start the server
-server.connect(new StdioServerTransport())
-  .then(() => console.error('WireMCP Server is running...'))
-  .catch(err => {
-    console.error('Failed to start WireMCP:', err);
-    process.exit(1);
-  });
+// Main entry point - supports both STDIO and HTTP transports
+async function main() {
+  const args = process.argv.slice(2);
+  const isHttp = args.includes('--http');
+  const portIndex = args.indexOf('--port');
+  const port = portIndex !== -1 ? parseInt(args[portIndex + 1]) : 3000;
+
+  if (isHttp) {
+    // HTTP mode: Streamable HTTP Transport
+    const httpServer = new McpServer({
+      name: 'wiremcp',
+      version: '1.0.0',
+    });
+    registerTools(httpServer);
+    registerPrompts(httpServer);
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => crypto.randomUUID(),
+    });
+    await httpServer.connect(transport);
+
+    const app = express();
+    app.use(express.json());
+    app.all('/mcp', async (req, res) => {
+      await transport.handleRequest(req, res, req.body);
+    });
+    app.listen(port, () => {
+      console.error(`WireMCP HTTP server listening on http://localhost:${port}/mcp`);
+    });
+  } else {
+    // STDIO mode (default, original behavior)
+    const stdioServer = new McpServer({
+      name: 'wiremcp',
+      version: '1.0.0',
+    });
+    registerTools(stdioServer);
+    registerPrompts(stdioServer);
+    await stdioServer.connect(new StdioServerTransport());
+    console.error('WireMCP Server is running...');
+  }
+}
+
+main().catch(err => {
+  console.error('Failed to start WireMCP:', err);
+  process.exit(1);
+});

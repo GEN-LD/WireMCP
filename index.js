@@ -62,7 +62,22 @@ async function validatePcapPath(p) {
 }
 
 /**
- * 生成安全的临时文件路径
+ * 解析 tshark 参数为数组
+ * @param {string} args - 用户输入的参数字符串
+ * @returns {string[]}
+ */
+function parseTsharkArgs(args) {
+  const argArray = [];
+  const regex = /[^\s"']+|"([^"]*)"|'([^']*)'/g;
+  let match;
+  while ((match = regex.exec(args)) !== null) {
+    const value = match[1] || match[2] || match[0];
+    if (value) argArray.push(value);
+  }
+  return argArray;
+}
+
+/** * 生成安全的临时文件路径
  * 使用 os.tmpdir() + 唯一文件名，避免硬编码文件名被猜到或产生冲突
  */
 function createTempPcapPath() {
@@ -376,7 +391,68 @@ server.tool(
   }
 );
 
-// Tool 6: Analyze an existing PCAP file for general context
+// Tool 6: Execute custom tshark command on a PCAP file
+// 【功能说明】当 WireMCP 其他工具无法满足特定分析需求时，允许执行自定义 tshark 命令
+// 【管道支持】支持 | 符号进行管道操作
+server.tool(
+  'exec_tshark',
+  'Execute a custom tshark command on a PCAP file for advanced network analysis when other tools are insufficient. Supports pipe commands (| grep, | head, | cut, etc.) for text processing. NOTE: For HTTP content extraction, use "http.file_data" instead of "data-text-lines" (which only returns summaries).',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+    tsharkArgs: z.string().describe('Tshark command arguments. Supports pipes. Example: "-T fields -e tcp.payload -Y http | grep -i flag"'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, tsharkArgs } = args;
+      console.error(`执行自定义 tshark 命令: ${tsharkArgs}`);
+      console.error(`分析 PCAP 文件: ${pcapPath}`);
+
+      // 直接使用用户输入的路径和参数
+      const safePcapPath = path.resolve(pcapPath);
+
+      // 解析 tshark 参数为数组
+      const argsArray = parseTsharkArgs(tsharkArgs);
+
+      // 构建完整的参数数组：读取 pcap 文件 + 用户自定义参数
+      const fullArgs = ['-r', safePcapPath, ...argsArray];
+
+      // 使用 execFileAsync 执行
+      const { stdout, stderr } = await execFileAsync(
+        tsharkPath,
+        fullArgs,
+        {
+          maxBuffer: 10 * 1024 * 1024,
+          env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+        }
+      );
+      if (stderr) console.error(`tshark stderr: ${stderr}`);
+
+      // 【数据截断】限制输出大小，防止超大数据影响 LLM 分析
+      const maxChars = 720000;
+      let output = stdout;
+      if (output.length > maxChars) {
+        output = output.slice(0, maxChars) + '\n... [输出已截断，数据过大]';
+        console.error(`输出已从 ${stdout.length} 字符截断到 ${maxChars} 字符`);
+      }
+
+      // 【输出格式化】提供执行信息和数据供 LLM 分析
+      const pipeInfo = pipeCommands.length > 0 ? ` | ${pipeCommands.map(p => `${p.originalName} ${p.args.join(' ')}`).join(' | ')}` : '';
+      const outputText = `执行的 tshark 命令: tshark -r ${pcapPath} ${tsharkArgs.split('|')[0].trim()}${pipeInfo}\n\n` +
+        `分析结果:\n${output}\n\n` +
+        `【提示】请根据上述数据进行网络流量分析，识别异常模式、协议特征或安全风险。`;
+
+      return {
+        content: [{ type: 'text', text: outputText }],
+      };
+    } catch (error) {
+      console.error(`Error in exec_tshark: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Tool 7: Analyze an existing PCAP file for general context
 server.tool(
   'analyze_pcap',
   'Analyze a PCAP file and provide general packet data as JSON for LLM analysis',
@@ -694,6 +770,44 @@ server.prompt(
 2. Evaluate the IP's reputation
 3. Identify any known malicious activity
 4. Provide security recommendations`
+      }
+    }]
+  })
+);
+
+server.prompt(
+  'exec_tshark_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+    tsharkArgs: z.string().optional().describe('Optional tshark arguments hint'),
+  },
+  ({ pcapPath, tsharkArgs = '' }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `【重要提示】当 WireMCP 的其他工具（如 analyze_pcap、get_conversations、check_ip_threats 等）都无法满足你的分析需求时，请使用 exec_tshark 工具执行自定义 tshark 命令。
+请分析 PCAP 文件 ${pcapPath}，当需要特定数据时：
+1. 首先评估 WireMCP 现有工具是否能满足需求
+2. 如果现有工具不足，使用 exec_tshark 工具执行自定义 tshark 命令获取所需数据
+3. 常用 tshark 参数示例：
+   - 提取 HTTP 响应内容: "-T fields -e http.file_data -Y http.response" (注意：data-text-lines 只返回汇总信息)
+   - 提取 HTTP 头: "-T fields -e http.request.method -e http.host -e http.user_agent"
+   - 提取 DNS 查询: "-T fields -e dns.qry.name -e dns.a"
+   - 提取 SSL/TLS 信息: "-T fields -e ssl.handshake.type -e tls.handshake.extensions_server_name"
+   - 统计协议分布: "-qz io,phs"
+   - 显示数据包详情: "-V" (注意：大文件可能超出缓冲区限制)
+4. 过滤表达式示例：
+   - 按协议过滤: "-Y http" 或 "-Y dns"
+   - 按内容过滤: "-Y http.request.uri contains \"flag\""
+   - 按 IP 过滤: "-Y ip.addr == 192.168.1.1"
+5. 【管道支持】exec_tshark 支持 | 符号进行管道操作，可使用任意 shell 命令进行数据处理
+   - 搜索关键词: "-T fields -e tcp.payload -Y http | grep -i flag"
+   - 显示前N行: "-T fields -e http.file_data -Y http | head -20"
+   - 去重统计: "-T fields -e ip.src | sort | uniq -c"
+6. 可使用 exec_tshark 工具执行自定义 tshark 和管道命令
+
+${tsharkArgs ? `建议的参数: ${tsharkArgs}` : ''}`
       }
     }]
   })

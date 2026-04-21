@@ -391,33 +391,37 @@ server.tool(
   }
 );
 
-// Tool 6: Execute custom tshark command on a PCAP file
-// 【功能说明】当 WireMCP 其他工具无法满足特定分析需求时，允许执行自定义 tshark 命令
-// 【管道支持】支持 | 符号进行管道操作
+// 工具6: 在PCAP文件上执行自定义tshark命令
+// 【功能说明】当WireMCP其他内置工具无法满足特定分析需求时，提供高级自定义分析能力
+// 【适用场景】复杂过滤、特定字段提取、自定义统计分析等特殊分析需求
+// 【注意事项】优先使用内置工具（如analyze_pcap、extract_credentials等），内置工具无法满足时再使用本工具
 server.tool(
   'exec_tshark',
-  'Execute a custom tshark command on a PCAP file for advanced network analysis when other tools are insufficient. Supports pipe commands (| grep, | head, | cut, etc.) for text processing. NOTE: For HTTP content extraction, use "http.file_data" instead of "data-text-lines" (which only returns summaries).',
+  'Execute a custom tshark command on a PCAP file for advanced network analysis when other tools are insufficient. NOTE: For HTTP content extraction, use "http.file_data" instead of "data-text-lines" (which only returns summaries).',
   {
-    pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
-    tsharkArgs: z.string().describe('Tshark command arguments. Supports pipes. Example: "-T fields -e tcp.payload -Y http | grep -i flag"'),
+    pcapPath: z.string().describe('待分析的PCAP文件路径，例如：./demo.pcap'),
+    tsharkArgs: z.string().describe('tshark命令参数，例如："-T fields -e tcp.payload -Y http.request.uri contains flag"'),
   },
   async (args) => {
     try {
+      // 查找tshark可执行文件路径
       const tsharkPath = await findTshark();
       const { pcapPath, tsharkArgs } = args;
-      console.error(`执行自定义 tshark 命令: ${tsharkArgs}`);
-      console.error(`分析 PCAP 文件: ${pcapPath}`);
+      console.error(`执行自定义tshark命令: ${tsharkArgs}`);
+      console.error(`分析PCAP文件: ${pcapPath}`);
 
-      // 直接使用用户输入的路径和参数
+      // 【路径安全处理】将输入路径解析为绝对路径，防止路径穿越攻击
       const safePcapPath = path.resolve(pcapPath);
 
-      // 解析 tshark 参数为数组
+      // 【参数解析】将用户输入的参数字符串解析为安全的参数数组
+      // 支持带引号的参数，例如：-Y "http.request.method == GET"
       const argsArray = parseTsharkArgs(tsharkArgs);
 
-      // 构建完整的参数数组：读取 pcap 文件 + 用户自定义参数
+      // 【构建完整命令参数】自动添加-r参数读取指定pcap文件，再拼接用户自定义参数
       const fullArgs = ['-r', safePcapPath, ...argsArray];
 
-      // 使用 execFileAsync 执行
+      // 【安全执行】使用execFileAsync执行命令，不经过shell解析，从根本上避免命令注入风险
+      // 设置10MB缓冲区，支持较大的分析结果输出
       const { stdout, stderr } = await execFileAsync(
         tsharkPath,
         fullArgs,
@@ -426,28 +430,27 @@ server.tool(
           env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
         }
       );
-      if (stderr) console.error(`tshark stderr: ${stderr}`);
+      if (stderr) console.error(`tshark标准错误输出: ${stderr}`);
 
-      // 【数据截断】限制输出大小，防止超大数据影响 LLM 分析
+      // 【输出大小限制】防止超大数据量导致LLM上下文溢出，超过720K字符时自动截断
       const maxChars = 720000;
       let output = stdout;
       if (output.length > maxChars) {
-        output = output.slice(0, maxChars) + '\n... [输出已截断，数据过大]';
+        output = output.slice(0, maxChars) + '\n... [输出已截断，数据量超过上下文限制]';
         console.error(`输出已从 ${stdout.length} 字符截断到 ${maxChars} 字符`);
       }
 
-      // 【输出格式化】提供执行信息和数据供 LLM 分析
-      const pipeInfo = pipeCommands.length > 0 ? ` | ${pipeCommands.map(p => `${p.originalName} ${p.args.join(' ')}`).join(' | ')}` : '';
-      const outputText = `执行的 tshark 命令: tshark -r ${pcapPath} ${tsharkArgs.split('|')[0].trim()}${pipeInfo}\n\n` +
+      // 【结果格式化】整理输出信息，方便LLM分析使用
+      const outputText = `执行的tshark命令: tshark -r ${pcapPath} ${tsharkArgs}\n\n` +
         `分析结果:\n${output}\n\n` +
-        `【提示】请根据上述数据进行网络流量分析，识别异常模式、协议特征或安全风险。`;
+        `【分析提示】请根据上述输出数据进行网络流量分析，识别异常通信模式、协议特征、敏感信息泄露或安全攻击行为。`;
 
       return {
         content: [{ type: 'text', text: outputText }],
       };
     } catch (error) {
-      console.error(`Error in exec_tshark: ${error.message}`);
-      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+      console.error(`exec_tshark执行错误: ${error.message}`);
+      return { content: [{ type: 'text', text: `执行错误: ${error.message}` }], isError: true };
     }
   }
 );
@@ -778,36 +781,35 @@ server.prompt(
 server.prompt(
   'exec_tshark_prompt',
   {
-    pcapPath: z.string().describe('Path to the PCAP file'),
-    tsharkArgs: z.string().optional().describe('Optional tshark arguments hint'),
+    pcapPath: z.string().describe('PCAP文件路径'),
+    tsharkArgs: z.string().optional().describe('可选的tshark参数提示'),
   },
   ({ pcapPath, tsharkArgs = '' }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `【重要提示】当 WireMCP 的其他工具（如 analyze_pcap、get_conversations、check_ip_threats 等）都无法满足你的分析需求时，请使用 exec_tshark 工具执行自定义 tshark 命令。
-请分析 PCAP 文件 ${pcapPath}，当需要特定数据时：
-1. 首先评估 WireMCP 现有工具是否能满足需求
-2. 如果现有工具不足，使用 exec_tshark 工具执行自定义 tshark 命令获取所需数据
-3. 常用 tshark 参数示例：
-   - 提取 HTTP 响应内容: "-T fields -e http.file_data -Y http.response" (注意：data-text-lines 只返回汇总信息)
-   - 提取 HTTP 头: "-T fields -e http.request.method -e http.host -e http.user_agent"
-   - 提取 DNS 查询: "-T fields -e dns.qry.name -e dns.a"
-   - 提取 SSL/TLS 信息: "-T fields -e ssl.handshake.type -e tls.handshake.extensions_server_name"
-   - 统计协议分布: "-qz io,phs"
-   - 显示数据包详情: "-V" (注意：大文件可能超出缓冲区限制)
-4. 过滤表达式示例：
-   - 按协议过滤: "-Y http" 或 "-Y dns"
-   - 按内容过滤: "-Y http.request.uri contains \"flag\""
-   - 按 IP 过滤: "-Y ip.addr == 192.168.1.1"
-5. 【管道支持】exec_tshark 支持 | 符号进行管道操作，可使用任意 shell 命令进行数据处理
-   - 搜索关键词: "-T fields -e tcp.payload -Y http | grep -i flag"
-   - 显示前N行: "-T fields -e http.file_data -Y http | head -20"
-   - 去重统计: "-T fields -e ip.src | sort | uniq -c"
-6. 可使用 exec_tshark 工具执行自定义 tshark 和管道命令
+        text: `【重要提示】当WireMCP的其他内置工具（如analyze_pcap、get_conversations、extract_credentials、check_ip_threats等）无法满足你的分析需求时，再使用exec_tshark工具执行自定义tshark命令。
+请分析PCAP文件 ${pcapPath}，需要获取特定数据时：
+1. 优先尝试使用WireMCP内置工具，内置工具提供了更优化的输出格式和安全保障
+2. 确认内置工具无法满足需求后，使用exec_tshark工具执行自定义tshark命令
+3. 常用tshark参数参考示例：
+   - 提取HTTP响应内容: "-T fields -e http.file_data -Y http.response" （注意：不要使用data-text-lines，它只返回汇总信息）
+   - 提取HTTP请求头: "-T fields -e http.request.method -e http.host -e http.user_agent -e http.request.uri"
+   - 提取DNS查询记录: "-T fields -e dns.qry.name -e dns.a -e dns.aaaa"
+   - 提取SSL/TLS握手信息: "-T fields -e ssl.handshake.type -e tls.handshake.extensions_server_name -e tls.cipher_suite"
+   - 统计协议层级分布: "-qz io,phs"
+   - 显示完整数据包详情: "-V" （注意：大文件使用该参数可能会超出缓冲区限制，建议配合过滤条件使用）
+4. 常用过滤表达式示例：
+   - 按协议过滤: "-Y http" 或 "-Y dns" 或 "-Y ftp"
+   - 按内容匹配过滤: "-Y http.request.uri contains \"flag\""
+   - 按IP地址过滤: "-Y ip.addr == 192.168.1.1"
+   - 按端口过滤: "-Y tcp.port == 8080"
+5. 参数使用注意事项：
+   - 包含空格的参数值需要用引号包裹，例如：-Y "http.request.method == GET"
+   - 复杂分析建议分多次执行，避免单次返回数据量过大
 
-${tsharkArgs ? `建议的参数: ${tsharkArgs}` : ''}`
+${tsharkArgs ? `推荐使用的参数: ${tsharkArgs}` : ''}`
       }
     }]
   })

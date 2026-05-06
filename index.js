@@ -53,10 +53,21 @@ function validateDuration(d) {
  * 规范化为绝对路径，禁止路径穿越（包含 ".."），并检查文件是否存在
  */
 async function validatePcapPath(p) {
+  const ALLOWED_EXTENSIONS = ['.pcap', '.pcapng', '.cap'];
+
   if (typeof p !== 'string' || p.includes('..') || p.includes('\0')) {
     throw new Error(`非法的文件路径: "${p}"。路径中不允许包含 ".." 或空字符。`);
   }
   const resolved = path.resolve(p);
+  const ext = path.extname(resolved).toLowerCase();
+
+  if (!ALLOWED_EXTENSIONS.includes(ext)) {
+    throw new Error(
+      `不支持的文件扩展名: "${ext}"。仅允许以下扩展名: ${ALLOWED_EXTENSIONS.join(', ')}\n` +
+      `请确保文件为标准的 PCAP 格式。`
+    );
+  }
+
   await fs.access(resolved);
   return resolved;
 }
@@ -75,6 +86,168 @@ function parseTsharkArgs(args) {
     if (value) argArray.push(value);
   }
   return argArray;
+}
+
+/**
+ * 校验 tshark 参数数组，阻止危险参数注入
+ * 当检测到命令注入等不当使用行为时，抛错并给出合法替代方案建议
+ * @param {string[]} args - 解析后的参数数组
+ * @throws {Error} 当包含危险参数时抛出详细错误
+ */
+function validateTsharkArgs(args) {
+  const dangerousParams = {
+    '-X': {
+      patterns: ['-X', '--lua-script', '--export-objects'],
+      reason: '可能执行任意 Lua 脚本或导出文件到任意目录，存在代码执行和文件系统风险',
+      alternatives: [
+        '使用 -T fields -e <field> 提取特定协议字段数据（如 -T fields -e http.request.uri）',
+        '使用 -Y "<filter>" 进行显示过滤分析（如 -Y "http.request.method == GET"）',
+        '使用 -V 查看完整协议解码详情',
+        '使用 -z io,phs 生成协议层级统计报告',
+        '使用 -z follow,tcp,ascii,0 追踪 TCP 流内容'
+      ]
+    },
+    '-o': {
+      patterns: ['-o', '--override-prefs'],
+      reason: '可能覆盖关键偏好设置导致非预期行为或安全策略绕过',
+      alternatives: [
+        '使用 -Y "<filter>" 精确控制显示内容范围',
+        '使用 -O <protocol> 仅详细显示指定协议（如 -O http）',
+        '使用 -T fields -e <field> 精确提取所需字段，避免多余输出'
+      ]
+    },
+    '-C': {
+      patterns: ['-C', '--configuration-profile'],
+      reason: '可能加载包含恶意配置的配置文件，导致非预期行为',
+      alternatives: [
+        '使用标准过滤器和字段提取参数替代自定义配置',
+        '使用 -Y "<filter>" 和 -e <field> 组合实现分析目标',
+        '使用 -T json 输出结构化数据便于分析'
+      ]
+    },
+    '-r': {
+      patterns: ['-r', '--read-file'],
+      reason: '可能覆盖 PCAP 文件路径，读取非授权或恶意构造的文件',
+      alternatives: [
+        'PCAP 文件路径已通过 pcapPath 参数指定，无需在 tsharkArgs 中重复设置 -r',
+        '如需分析多个文件，请多次调用 exec_tshark 工具，每次指定不同 pcapPath',
+        '如需合并分析，请使用其他工具在调用前合并 PCAP 文件'
+      ]
+    },
+    '-w': {
+      patterns: ['-w', '--write-file'],
+      reason: '可能在系统任意位置写入文件，覆盖关键系统文件或造成磁盘耗尽',
+      alternatives: [
+        '使用 -T fields -e <field> 提取数据到标准输出，结果已在返回的文本中',
+        '使用 -T json 输出结构化 JSON 数据，便于客户端解析和保存',
+        '使用 -T pdml 输出 Packet Details Markup Language 格式',
+        '如需保存结果，请在客户端保存工具返回的文本内容'
+      ]
+    },
+    '-F': {
+      patterns: ['-F'],
+      reason: '可能生成非预期的输出格式文件，通常配合 -w 使用造成文件操作风险',
+      alternatives: [
+        '使用 -T <format> 控制文本输出格式（支持 fields, json, pdml, text, ps, psml）',
+        '输出内容已包含在工具返回结果中，无需额外写入文件'
+      ]
+    },
+    '-b': {
+      patterns: ['-b', '--ring-buffer'],
+      reason: '可能在磁盘上创建多个捕获文件，造成磁盘空间耗尽或服务拒绝',
+      alternatives: [
+        '使用 -c <count> 限制读取的数据包数量（如 -c 1000）',
+        '使用 -Y "<filter>" 过滤后再分析，减少处理的数据量',
+        '通过返回结果在内存中分析数据，无需本地存储中间文件'
+      ]
+    },
+    '-U': {
+      patterns: ['-U', '--update-interval'],
+      reason: '通常配合文件写入使用（如 -w），可能导致持续性的文件操作风险',
+      alternatives: [
+        '直接读取已存在的完整 pcap 文件，无需实时更新',
+        '如需持续监控，请使用 capture_packets 工具进行实时捕获'
+      ]
+    }
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    let violationKey = null;
+    let matchedPattern = null;
+
+    if (typeof arg !== 'string') continue;
+
+    if (arg.length >= 2 && arg[0] === '-' && arg[1] !== '-') {
+      const shortFlags = Object.keys(dangerousParams);
+      for (const flag of shortFlags) {
+        if (arg === flag) {
+          violationKey = flag;
+          matchedPattern = arg;
+          break;
+        }
+        if (arg.startsWith(flag) && arg.length > flag.length) {
+          const nextChar = arg[flag.length];
+          if (nextChar !== undefined && nextChar !== ' ') {
+            violationKey = flag;
+            matchedPattern = arg;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!violationKey) {
+      for (const [key, info] of Object.entries(dangerousParams)) {
+        for (const pattern of info.patterns) {
+          if (pattern.startsWith('--')) {
+            if (arg === pattern || arg.startsWith(`${pattern}=`) || arg.startsWith(`${pattern}:`)) {
+              violationKey = key;
+              matchedPattern = arg;
+              break;
+            }
+          }
+        }
+        if (violationKey) break;
+      }
+    }
+
+    if (!violationKey && (arg.startsWith('-X:') || arg.startsWith('-X='))) {
+      violationKey = '-X';
+      matchedPattern = arg;
+    }
+
+    if (violationKey) {
+      const info = dangerousParams[violationKey];
+      const alternatives = info.alternatives.map(a => `  • ${a}`).join('\n');
+      throw new Error(
+        `【安全拦截】检测到危险参数 "${matchedPattern}"。\n` +
+        `风险说明：${info.reason}\n` +
+        `为了保障系统安全，已禁止在自定义 tshark 参数中使用此选项。\n\n` +
+        `您可以尝试以下合法替代方案来达到相同的分析效果：\n${alternatives}\n\n` +
+        `如需了解完整的 tshark 参数用法，请参考工具描述中的参数示例。`
+      );
+    }
+  }
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-Y' || args[i] === '--display-filter') {
+      if (i + 1 < args.length) {
+        const filterValue = args[i + 1];
+        if (typeof filterValue === 'string' && (filterValue.includes('\0') || filterValue.includes('\n'))) {
+          throw new Error(
+            `【安全拦截】检测到过滤表达式包含非法字符（空字符或换行符）。\n` +
+            `请使用标准的 Wireshark 显示过滤器语法，例如：\n` +
+            `  • ip.addr == 192.168.1.1\n` +
+            `  • http.request.method == "GET"\n` +
+            `  • tcp.port == 80 && http.host contains "example"\n` +
+            `  • dns.qry.name matches ".*\\.example\\.com"\n` +
+            `  • frame.len > 1000`
+          );
+        }
+      }
+    }
+  }
 }
 
 /** * 生成安全的临时文件路径
@@ -397,10 +570,10 @@ server.tool(
 // 【注意事项】优先使用内置工具（如analyze_pcap、extract_credentials等），内置工具无法满足时再使用本工具
 server.tool(
   'exec_tshark',
-  'Execute a custom tshark command on a PCAP file for advanced network analysis when other tools are insufficient. NOTE: For HTTP content extraction, use "http.file_data" instead of "data-text-lines" (which only returns summaries).',
+  'Execute a custom tshark command on a PCAP file for advanced network analysis when other tools are insufficient. NOTE: For HTTP content extraction, use "http.file_data" instead of "data-text-lines" (which only returns summaries). IMPORTANT: Filter values containing spaces or logical operators (&&, ||, !) MUST be wrapped in quotes, e.g., -Y "tcp.port == 80 && http.host contains \\"example\\""',
   {
     pcapPath: z.string().describe('待分析的PCAP文件路径，例如：./demo.pcap'),
-    tsharkArgs: z.string().describe('tshark命令参数，例如："-T fields -e tcp.payload -Y http.request.uri contains flag"'),
+    tsharkArgs: z.string().describe('tshark命令参数字符串，必须用引号包裹。如果参数内部也包含引号，需要转义。示例："-T fields -e http.host -Y \\"http.request.uri contains \\\\\\"flag\\\\\\"\\""。注意：所有包含空格或逻辑运算符（&&、||、!）的 -Y 过滤值都必须用引号包裹，例如：-Y \\"tcp.port == 80 && http.request.method == GET\\"'),
   },
   async (args) => {
     try {
@@ -410,14 +583,18 @@ server.tool(
       console.error(`执行自定义tshark命令: ${tsharkArgs}`);
       console.error(`分析PCAP文件: ${pcapPath}`);
 
-      // 【路径安全处理】将输入路径解析为绝对路径，防止路径穿越攻击
-      const safePcapPath = path.resolve(pcapPath);
+      // 【路径安全处理】规范化路径并校验扩展名，防止路径穿越和文件类型混淆攻击
+      const safePcapPath = await validatePcapPath(pcapPath);
 
       // 【参数解析】将用户输入的参数字符串解析为安全的参数数组
       // 支持带引号的参数，例如：-Y "http.request.method == GET"
       const argsArray = parseTsharkArgs(tsharkArgs);
 
+      // 【参数安全校验】检测并阻止危险参数注入，发现不当使用时给出合法替代方案
+      validateTsharkArgs(argsArray);
+
       // 【构建完整命令参数】自动添加-r参数读取指定pcap文件，再拼接用户自定义参数
+      // 由于已校验 argsArray 不含 -r/--read-file，不会覆盖安全路径
       const fullArgs = ['-r', safePcapPath, ...argsArray];
 
       // 【安全执行】使用execFileAsync执行命令，不经过shell解析，从根本上避免命令注入风险
@@ -494,21 +671,31 @@ server.tool(
       const protocols = [...new Set(packets.map(p => p._source?.layers['frame.protocols']?.[0]))].filter(p => p);
       console.error(`Found protocols: ${protocols.join(', ') || 'None'}`);
 
-      const maxChars = 720000;
+      const maxChars = 200000;
+      const totalPackets = packets.length;
       let jsonString = JSON.stringify(packets);
+      const originalSize = jsonString.length;
+      let trimmed = false;
+      let trimCount = totalPackets;
       if (jsonString.length > maxChars) {
         const trimFactor = maxChars / jsonString.length;
-        const trimCount = Math.floor(packets.length * trimFactor);
+        trimCount = Math.floor(packets.length * trimFactor);
         packets.splice(trimCount);
         jsonString = JSON.stringify(packets);
-        console.error(`Trimmed packets from ${packets.length} to ${trimCount} to fit ${maxChars} chars`);
+        trimmed = true;
+        console.error(`Trimmed packets from ${totalPackets} to ${trimCount} to fit ${maxChars} chars`);
       }
 
       const outputText = `Analyzed PCAP: ${pcapPath}\n\n` +
         `Unique IPs:\n${ips.join('\n')}\n\n` +
         `URLs:\n${urls.length > 0 ? urls.join('\n') : 'None'}\n\n` +
         `Protocols:\n${protocols.join('\n') || 'None'}\n\n` +
-        `Packet Data (JSON for LLM):\n${jsonString}`;
+        `Data Truncation Info:\n` +
+        `  - Original JSON size: ${(originalSize / 1024).toFixed(1)} KB (${originalSize} chars)\n` +
+        `  - Truncated: ${trimmed ? 'Yes' : 'No'}\n` +
+        (trimmed ? `  - Truncated size: ${(jsonString.length / 1024).toFixed(1)} KB (${jsonString.length} chars)\n` +
+        `  - Retained: First ${trimCount} of ${totalPackets} packets (from the beginning of the capture)\n` : '') +
+        `\nPacket Data (JSON for LLM):\n${jsonString}`;
 
       return {
         content: [{ type: 'text', text: outputText }],
@@ -520,7 +707,7 @@ server.tool(
   }
 );
 
-// Tool 7: Extract credentials from a PCAP file
+// Tool 8: Extract credentials from a PCAP file
 server.tool(
     'extract_credentials',
     'Extract potential credentials (HTTP Basic Auth, FTP, Telnet) from a PCAP file for LLM analysis',
@@ -794,20 +981,26 @@ server.prompt(
 1. 优先尝试使用WireMCP内置工具，内置工具提供了更优化的输出格式和安全保障
 2. 确认内置工具无法满足需求后，使用exec_tshark工具执行自定义tshark命令
 3. 常用tshark参数参考示例：
-   - 提取HTTP响应内容: "-T fields -e http.file_data -Y http.response" （注意：不要使用data-text-lines，它只返回汇总信息）
-   - 提取HTTP请求头: "-T fields -e http.request.method -e http.host -e http.user_agent -e http.request.uri"
-   - 提取DNS查询记录: "-T fields -e dns.qry.name -e dns.a -e dns.aaaa"
-   - 提取SSL/TLS握手信息: "-T fields -e ssl.handshake.type -e tls.handshake.extensions_server_name -e tls.cipher_suite"
-   - 统计协议层级分布: "-qz io,phs"
-   - 显示完整数据包详情: "-V" （注意：大文件使用该参数可能会超出缓冲区限制，建议配合过滤条件使用）
-4. 常用过滤表达式示例：
-   - 按协议过滤: "-Y http" 或 "-Y dns" 或 "-Y ftp"
-   - 按内容匹配过滤: "-Y http.request.uri contains \"flag\""
-   - 按IP地址过滤: "-Y ip.addr == 192.168.1.1"
-   - 按端口过滤: "-Y tcp.port == 8080"
+   - 提取HTTP响应内容: -T fields -e http.file_data -Y "http.response" （注意：不要使用data-text-lines，它只返回汇总信息）
+   - 提取HTTP请求头: -T fields -e http.request.method -e http.host -e http.user_agent -e http.request.uri
+   - 提取DNS查询记录: -T fields -e dns.qry.name -e dns.a -e dns.aaaa
+   - 提取SSL/TLS握手信息: -T fields -e ssl.handshake.type -e tls.handshake.extensions_server_name -e tls.cipher_suite
+   - 统计协议层级分布: -qz io,phs
+   - 显示完整数据包详情: -V -c 1000 （注意：大文件建议配合 -c 限制包数，避免超出缓冲区限制）
+4. 常用过滤表达式示例（注意：所有 -Y 后的过滤值必须用引号包裹，特别是包含空格或逻辑运算符时）：
+   - 按协议过滤: -Y "http" 或 -Y "dns" 或 -Y "ftp"
+   - 按内容匹配过滤: -Y "http.request.uri contains \"flag\""
+   - 按IP地址过滤: -Y "ip.addr == 192.168.1.1"
+   - 按端口过滤: -Y "tcp.port == 8080"
+   - 逻辑与（AND）: -Y "http.request.method == \"GET\" && http.host contains \"example\""
+   - 逻辑或（OR）: -Y "tcp.port == 80 || tcp.port == 443"
+   - 逻辑非（NOT）: -Y "!(tcp.port == 22)"
+   - 组合条件: -Y "ip.addr == 192.168.1.1 && (http.request.method == \"GET\" || http.request.method == \"POST\")"
 5. 参数使用注意事项：
-   - 包含空格的参数值需要用引号包裹，例如：-Y "http.request.method == GET"
+   - 包含空格或逻辑运算符（&&、||、!）的 -Y 过滤值必须用引号包裹，否则会被拆分为多个参数导致解析失败
+   - 引号格式规则：-Y "过滤表达式"，若表达式内部有引号则转义为 \\"
    - 复杂分析建议分多次执行，避免单次返回数据量过大
+   - 如果过滤结果为空，请检查过滤表达式是否正确（可先用 -Y "http" 测试基本过滤是否生效）
 
 ${tsharkArgs ? `推荐使用的参数: ${tsharkArgs}` : ''}`
       }

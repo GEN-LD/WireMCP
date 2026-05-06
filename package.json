@@ -12,6 +12,7 @@
     "@modelcontextprotocol/sdk": "^1.8.0",
     "axios": "^1.8.4",
     "child_process": "^1.0.2",
+    "gm-crypt": "^0.0.2",
     "util": "^0.12.5",
     "which": "^5.0.0",
     "zod": "^3.24.2"

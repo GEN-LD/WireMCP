@@ -73,6 +73,56 @@ async function validatePcapPath(p) {
 }
 
 /**
+ * 解码 tshark 输出中的十六进制字段
+ * tshark -T fields 模式下，二进制类型字段（如 http.file_data、tcp.payload）输出为十六进制字符串
+ * 大模型无法直接理解长 hex 串，需要自动解码为可读文本
+ *
+ * 判断逻辑：
+ * 1. 长度 >= 8 且为偶数（每2个hex字符=1字节）
+ * 2. 只包含 0-9a-f 字符
+ * 3. 解码后可打印字符占比 > 80%，视为文本内容，输出解码结果
+ * 4. 否则视为二进制数据，保留原始 hex 并标注 [binary data]
+ *
+ * @param {string} output - tshark 原始输出
+ * @returns {string} 解码后的输出
+ */
+function decodeHexFields(output) {
+  const HEX_MIN_LENGTH = 8;
+  const PRINTABLE_RATIO_THRESHOLD = 0.8;
+
+  return output.split('\n').map(line => {
+    return line.split('\t').map(field => {
+      // 快速排除：长度不足或非偶数
+      if (field.length < HEX_MIN_LENGTH || field.length % 2 !== 0) return field;
+      // 快速排除：包含非hex字符
+      if (!/^[0-9a-f]+$/i.test(field)) return field;
+
+      // 尝试 hex 解码
+      try {
+        const decoded = Buffer.from(field, 'hex').toString('utf-8');
+        // 计算可打印字符占比
+        let printable = 0;
+        for (let i = 0; i < decoded.length; i++) {
+          const code = decoded.charCodeAt(i);
+          // 可打印范围：空格(0x20)~波浪号(0x7E)，加上 \r \n \t
+          if ((code >= 0x20 && code <= 0x7E) || code === 0x0D || code === 0x0A || code === 0x09) {
+            printable++;
+          }
+        }
+        const ratio = printable / decoded.length;
+        if (ratio >= PRINTABLE_RATIO_THRESHOLD) {
+          return decoded;
+        } else {
+          return field + ' [binary data]';
+        }
+      } catch {
+        return field;
+      }
+    }).join('\t');
+  }).join('\n');
+}
+
+/**
  * 解析 tshark 参数为数组
  * @param {string} args - 用户输入的参数字符串
  * @returns {string[]}
@@ -345,44 +395,34 @@ function registerTools(server) {
   }
 );
 
-// Tool 2: Capture and provide summary statistics
+// Tool 2: Analyze a PCAP file and provide protocol hierarchy statistics
 server.tool(
   'get_summary_stats',
-  'Capture live traffic and provide protocol hierarchy statistics for LLM analysis',
+  'Analyze a PCAP file and provide protocol hierarchy statistics for LLM analysis',
   {
-    interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
-    duration: z.number().optional().default(5).describe('Capture duration in seconds'),
+    pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
   },
   async (args) => {
     try {
       const tsharkPath = await findTshark();
-      const { interface, duration } = args;
-      // 【安全修复】白名单校验用户输入，防止命令注入
-      validateInterface(interface);
-      validateDuration(duration);
-      const tempPcap = createTempPcapPath();
-      console.error(`Capturing summary stats on ${interface} for ${duration}s`);
+      const { pcapPath } = args;
+      console.error(`Analyzing summary stats for PCAP: ${pcapPath}`);
 
-      // 【安全修复】使用 execFileAsync 参数数组方式调用，绕过 shell 解析
-      await execFileAsync(
-        tsharkPath,
-        ['-i', interface, '-w', tempPcap, '-a', `duration:${duration}`],
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
+      // 【安全修复】使用 validatePcapPath 替代 fs.access，一并完成路径规范化、安全检查和存在性验证
+      const safePcapPath = await validatePcapPath(pcapPath);
 
+      // 【安全修复】使用 execFileAsync + 参数数组，pcapPath 作为独立参数传入，不经过 shell
       const { stdout, stderr } = await execFileAsync(
         tsharkPath,
-        ['-r', tempPcap, '-qz', 'io,phs'],
+        ['-r', safePcapPath, '-qz', 'io,phs'],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
       if (stderr) console.error(`tshark stderr: ${stderr}`);
 
-      await fs.unlink(tempPcap).catch(err => console.error(`Failed to delete ${tempPcap}: ${err.message}`));
-
       return {
         content: [{
           type: 'text',
-          text: `Protocol hierarchy statistics for LLM analysis:\n${stdout}`,
+          text: `Analyzed PCAP: ${pcapPath}\n\nProtocol hierarchy statistics:\n${stdout}`,
         }],
       };
     } catch (error) {
@@ -395,41 +435,40 @@ server.tool(
 // Tool 3: Capture and provide conversation stats
 server.tool(
   'get_conversations',
-  'Capture live traffic and provide TCP/UDP conversation statistics for LLM analysis',
+  'Analyze a PCAP file and provide TCP conversation statistics for LLM analysis',
   {
-    interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
-    duration: z.number().optional().default(5).describe('Capture duration in seconds'),
+    pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
   },
   async (args) => {
     try {
       const tsharkPath = await findTshark();
-      const { interface, duration } = args;
-      // 【安全修复】白名单校验用户输入，防止命令注入
-      validateInterface(interface);
-      validateDuration(duration);
-      const tempPcap = createTempPcapPath();
-      console.error(`Capturing conversations on ${interface} for ${duration}s`);
+      const { pcapPath } = args;
+      console.error(`Analyzing conversations in PCAP: ${pcapPath}`);
 
-      // 【安全修复】使用 execFileAsync 参数数组方式调用，绕过 shell 解析
-      await execFileAsync(
-        tsharkPath,
-        ['-i', interface, '-w', tempPcap, '-a', `duration:${duration}`],
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
+      // 【路径安全处理】规范化路径并校验扩展名，防止路径穿越和文件类型混淆攻击
+      const safePcapPath = await validatePcapPath(pcapPath);
 
       const { stdout, stderr } = await execFileAsync(
         tsharkPath,
-        ['-r', tempPcap, '-qz', 'conv,tcp'],
+        ['-r', safePcapPath, '-qz', 'conv,tcp'],
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
       if (stderr) console.error(`tshark stderr: ${stderr}`);
 
-      await fs.unlink(tempPcap).catch(err => console.error(`Failed to delete ${tempPcap}: ${err.message}`));
+      // 【输出大小限制】防止超大数据量导致LLM上下文溢出，超过100K字符时自动截断
+      const maxChars = 100000;
+      let output = stdout;
+      if (output.length > maxChars) {
+        const originalLength = output.length;
+        output = output.slice(0, maxChars) +
+          `\n\n[数据已截断] 原始大小: ${originalLength} 字符, 截断后大小: ${maxChars} 字符, 截断方式: 保留前 ${maxChars} 字符`;
+        console.error(`输出已从 ${originalLength} 字符截断到 ${maxChars} 字符`);
+      }
 
       return {
         content: [{
           type: 'text',
-          text: `TCP/UDP conversation statistics for LLM analysis:\n${stdout}`,
+          text: `TCP conversation statistics for LLM analysis:\n${output}`,
         }],
       };
     } catch (error) {
@@ -609,12 +648,16 @@ server.tool(
       );
       if (stderr) console.error(`tshark标准错误输出: ${stderr}`);
 
+      // 【十六进制解码】tshark -T fields 模式下二进制字段输出为hex，大模型无法直接理解
+      // 自动检测hex字段并解码为可读文本，二进制数据保留原始hex并标注[binary data]
+      let output = decodeHexFields(stdout);
+
       // 【输出大小限制】防止超大数据量导致LLM上下文溢出，超过720K字符时自动截断
       const maxChars = 720000;
-      let output = stdout;
       if (output.length > maxChars) {
+        const originalLength = output.length;
         output = output.slice(0, maxChars) + '\n... [输出已截断，数据量超过上下文限制]';
-        console.error(`输出已从 ${stdout.length} 字符截断到 ${maxChars} 字符`);
+        console.error(`输出已从 ${originalLength} 字符截断到 ${maxChars} 字符`);
       }
 
       // 【结果格式化】整理输出信息，方便LLM分析使用

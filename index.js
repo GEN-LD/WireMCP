@@ -869,14 +869,14 @@ server.tool(
         });
 
         console.error(`Found ${credentials.plaintext.length} plaintext and ${credentials.encrypted.length} encrypted credentials`);
-  
+
         const outputText = `Analyzed PCAP: ${pcapPath}\n\n` +
-          `Plaintext Credentials:\n${credentials.plaintext.length > 0 ? 
-            credentials.plaintext.map(c => 
-              c.type === 'Telnet Prompt' ? 
-                `${c.type}: ${c.data} (Frame ${c.frame})` : 
+          `Plaintext Credentials:\n${credentials.plaintext.length > 0 ?
+            credentials.plaintext.map(c =>
+              c.type === 'Telnet Prompt' ?
+                `${c.type}: ${c.data} (Frame ${c.frame})` :
                 `${c.type}: ${c.username}:${c.password} (Frame ${c.frame})`
-            ).join('\n') : 
+            ).join('\n') :
             'None'}\n\n` +
           `Encrypted/Hashed Credentials:\n${credentials.encrypted.length > 0 ?
             credentials.encrypted.map(c =>
@@ -889,13 +889,892 @@ server.tool(
           `For Kerberos hashes:\n` +
           `- AS-REQ/TGS-REQ: hashcat -m 7500 or john --format=krb5pa-md5\n` +
           `- AS-REP: hashcat -m 18200 or john --format=krb5asrep`;
-  
+
         return {
           content: [{ type: 'text', text: outputText }],
         };
       } catch (error) {
         console.error(`Error in extract_credentials: ${error.message}`);
         return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // Tool 9: 分析四层网络问题
+  server.tool(
+    'analyze_l4_network',
+    '分析PCAP文件中传输层网络问题。先用tshark过滤命中的数据包，找到关联的TCP流，再逐流分析是否存在SYN无响应、RST拒绝、SYN重传、SYN Flood、超时重传、零窗口、异常RST、挥手不完整等问题。返回JSON格式报告。',
+    {
+      pcapPath: z.string().describe('待分析的PCAP文件路径，例如：./demo.pcap'),
+      tsharkArgs: z.string().describe('tshark命令参数字符串，用于过滤目标数据包。支持 -Y 过滤表达式，例如：-Y "http" 或 -Y "ip.addr == 10.0.0.1"'),
+    },
+    async (args) => {
+      try {
+        const tsharkPath = await findTshark();
+        const { pcapPath, tsharkArgs } = args;
+        console.error(`[analyze_l4_network] 开始分析: pcapPath=${pcapPath}, tsharkArgs=${tsharkArgs}`);
+
+        const safePcapPath = await validatePcapPath(pcapPath);
+        const parsedArgs = parseTsharkArgs(tsharkArgs);
+
+        // 从用户参数中提取 -Y 过滤器（保留，用于后续分析命令）
+        let userFilter = null;
+        const cleanArgs = [];
+        for (let i = 0; i < parsedArgs.length; i++) {
+          if (parsedArgs[i] === '-Y' || parsedArgs[i] === '--display-filter') {
+            userFilter = parsedArgs[i + 1] || null;
+            i++; // 跳过过滤器值
+            continue;
+          }
+          // 跳过用户传入的 -T / -e / -r 参数（输出格式由本工具控制）
+          if (parsedArgs[i] === '-T' || parsedArgs[i] === '-e' || parsedArgs[i] === '-r') {
+            i++; // 跳过对应的值
+            continue;
+          }
+          if (parsedArgs[i].startsWith('-T') || parsedArgs[i].startsWith('-e') || parsedArgs[i].startsWith('-r')) continue;
+          cleanArgs.push(parsedArgs[i]);
+        }
+
+        // ── Step 1: 用用户过滤条件提取命中的 TCP 流编号 ──
+        const getStreamsArgs = ['-r', safePcapPath, '-T', 'fields', '-e', 'tcp.stream'];
+        if (userFilter) getStreamsArgs.push('-Y', userFilter);
+
+        console.error(`[analyze_l4_network] Step1 提取流编号: ${getStreamsArgs.join(' ')}`);
+        const { stdout: streamsOut } = await execFileAsync(tsharkPath, getStreamsArgs, {
+          maxBuffer: 10 * 1024 * 1024,
+          env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+        });
+
+        const streamIndices = [...new Set(
+          streamsOut.split('\n')
+            .map(l => l.trim())
+            .filter(l => l !== '' && l !== '_')
+            .map(Number)
+            .filter(n => !isNaN(n))
+        )].sort((a, b) => a - b);
+
+        if (streamIndices.length === 0) {
+          const result = {
+            pcapPath,
+            filter: userFilter || null,
+            totalStreams: 0,
+            issues: [],
+            summary: '未找到匹配的TCP流，无法进行四层分析。请检查过滤条件或PCAP文件内容。'
+          };
+          return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        }
+        console.error(`[analyze_l4_network] 发现 ${streamIndices.length} 个TCP流: [${streamIndices.join(', ')}]`);
+
+        // ── Step 2: 逐流批量查询（使用 tshark -z 支持多流统计，减少调用次数）──
+        const streamFilter = streamIndices.map(n => `tcp.stream eq ${n}`).join(' || ');
+        const combinedFilter = userFilter ? `(${userFilter}) && (${streamFilter})` : streamFilter;
+
+        // 查询 A: 每个流的 TCP flags 汇总
+        const { stdout: flagsOut } = await execFileAsync(tsharkPath, [
+          '-r', safePcapPath, '-T', 'fields',
+          '-e', 'tcp.stream', '-e', 'tcp.flags', '-e', 'ip.src',
+          '-Y', combinedFilter
+        ], {
+          maxBuffer: 10 * 1024 * 1024,
+          env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+        });
+
+        // 查询 B: 每个流的 TCP 分析标记
+        const { stdout: analysisOut } = await execFileAsync(tsharkPath, [
+          '-r', safePcapPath, '-T', 'fields',
+          '-e', 'tcp.stream', '-e', 'tcp.analysis.retransmission',
+          '-e', 'tcp.analysis.duplicate_ack', '-e', 'tcp.analysis.zero_window',
+          '-e', 'tcp.analysis.keep_alive', '-e', 'tcp.analysis.window_update',
+          '-Y', combinedFilter
+        ], {
+          maxBuffer: 10 * 1024 * 1024,
+          env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+        });
+
+        // ── Step 3: 解析数据，按流分组 ──
+        const streamData = {};
+        for (const idx of streamIndices) {
+          streamData[idx] = {
+            streamIndex: idx,
+            synCount: 0, synAckCount: 0, rstCount: 0, finCount: 0, ackCount: 0,
+            otherFlags: 0, totalPackets: 0,
+            retransmissions: 0, duplicateAcks: 0, zeroWindows: 0,
+            keepAlives: 0, windowUpdates: 0,
+            hasRst: false, hasFin: false, hasSynAck: false,
+            srcIps: new Set(), synSrcIps: new Set(), rstSrcIps: new Set(),
+            isUnidirectional: false
+          };
+        }
+
+        // 解析 flags 数据
+        for (const line of flagsOut.split('\n')) {
+          if (!line.trim()) continue;
+          const [streamStr, flagsHex, srcIp] = line.split('\t');
+          const streamIdx = parseInt(streamStr);
+          if (isNaN(streamIdx) || !streamData[streamIdx]) continue;
+          const sd = streamData[streamIdx];
+          sd.totalPackets++;
+          sd.srcIps.add(srcIp);
+
+          const hex = parseInt(flagsHex, 16);
+          if ((hex & 0x012) === 0x002) { sd.synCount++; sd.synSrcIps.add(srcIp); }        // 纯 SYN（SYN=1, ACK=0）
+          if ((hex & 0x012) === 0x012) { sd.synAckCount++; sd.hasSynAck = true; }           // SYN-ACK（SYN=1, ACK=1）
+          if (hex & 0x004) { sd.rstCount++; sd.hasRst = true; sd.rstSrcIps.add(srcIp); }
+          if (hex & 0x001) { sd.finCount++; sd.hasFin = true; }
+          if ((hex & 0x010) && !(hex & 0x002) && !(hex & 0x001) && !(hex & 0x004)) sd.ackCount++;
+          if (!(hex & 0x002) && !(hex & 0x012) && !(hex & 0x004) && !(hex & 0x001) && !(hex & 0x010)) sd.otherFlags++;
+        }
+
+        // 计算每个流是否为单向捕获
+        for (const idx of streamIndices) {
+          streamData[idx].isUnidirectional = streamData[idx].srcIps.size === 1;
+        }
+
+        // 解析 analysis 数据
+        for (const line of analysisOut.split('\n')) {
+          if (!line.trim()) continue;
+          const parts = line.split('\t');
+          const streamIdx = parseInt(parts[0]);
+          if (isNaN(streamIdx) || !streamData[streamIdx]) continue;
+          const sd = streamData[streamIdx];
+          if (parts[1]) sd.retransmissions++;
+          if (parts[2]) sd.duplicateAcks++;
+          if (parts[3]) sd.zeroWindows++;
+          if (parts[4]) sd.keepAlives++;
+          if (parts[5]) sd.windowUpdates++;
+        }
+
+        // ── Step 4: 问题检测与分类 ──
+        const issues = [];
+
+        for (const idx of streamIndices) {
+          const sd = streamData[idx];
+          const streamIssues = [];
+
+          // 0. 单向流量检测
+          if (sd.isUnidirectional) {
+            streamIssues.push({
+              type: 'UNIDIRECTIONAL_CAPTURE',
+              severity: 'info',
+              description: `该流仅捕获单向流量(仅来自${[...sd.srcIps].join(', ')}端)，SYN无响应、异常RST断开、四次挥手等需要双向流量判断的检测已跳过。`,
+              detail: { srcIps: [...sd.srcIps] }
+            });
+          }
+
+          // 1. SYN 无响应：有 SYN 但无 SYN-ACK（需双向流量）
+          if (sd.synCount > 0 && sd.synAckCount === 0 && !sd.isUnidirectional) {
+            streamIssues.push({
+              type: 'SYN_NO_RESPONSE',
+              severity: 'high',
+              description: `发送了 ${sd.synCount} 个SYN包但未收到任何SYN-ACK响应`,
+              detail: { synCount: sd.synCount, synAckCount: sd.synAckCount }
+            });
+          }
+
+          // 2. 端口未开放（RST 拒绝）：有 SYN 且有 RST，且 RST 来自服务端
+          if (sd.synCount > 0 && sd.rstCount > 0 && sd.synAckCount === 0) {
+            const rstFromServer = [...sd.rstSrcIps].some(ip => !sd.synSrcIps.has(ip));
+            if (rstFromServer) {
+              streamIssues.push({
+                type: 'PORT_CLOSED_RST',
+                severity: 'high',
+                description: `SYN后收到来自服务端的RST拒绝，目标端口可能未开放`,
+                detail: { synCount: sd.synCount, rstCount: sd.rstCount }
+              });
+            }
+          }
+
+          // 3. 客户端 SYN 重传：客户端发送了多个纯 SYN 包
+          if (sd.synCount > 1) {
+            streamIssues.push({
+              type: 'SYN_RETRANSMISSION',
+              severity: 'high',
+              description: `客户端SYN包重传 ${sd.synCount} 次，可能存在连接超时`,
+              detail: { synCount: sd.synCount, synAckCount: sd.synAckCount }
+            });
+          }
+
+          // 3b. 服务端 SYN-ACK 重传：服务端发送了多个 SYN-ACK 包
+          if (sd.synAckCount > 1) {
+            streamIssues.push({
+              type: 'SYN_ACK_RETRANSMISSION',
+              severity: 'high',
+              description: `服务端SYN-ACK包重传 ${sd.synAckCount} 次，服务端可能未收到客户端ACK`,
+              detail: { synCount: sd.synCount, synAckCount: sd.synAckCount }
+            });
+          }
+
+          // 4. 超时重传（RTO）
+          if (sd.retransmissions > 0) {
+            streamIssues.push({
+              type: 'RETRANSMISSION',
+              severity: sd.retransmissions > 5 ? 'high' : 'medium',
+              description: `检测到 ${sd.retransmissions} 次TCP重传`,
+              detail: { retransmissions: sd.retransmissions }
+            });
+          }
+
+          // 5. 零窗口 — 结合 Window Update 判断严重度
+          if (sd.zeroWindows > 0) {
+            const unrecovered = sd.zeroWindows - sd.windowUpdates;
+            if (unrecovered > 0) {
+              streamIssues.push({
+                type: 'ZERO_WINDOW',
+                severity: 'high',
+                description: `检测到 ${sd.zeroWindows} 次零窗口，其中 ${unrecovered} 次未恢复（缺少Window Update），接收端可能持续阻塞`,
+                detail: { zeroWindows: sd.zeroWindows, windowUpdates: sd.windowUpdates, unrecovered }
+              });
+            } else {
+              streamIssues.push({
+                type: 'ZERO_WINDOW',
+                severity: 'medium',
+                description: `检测到 ${sd.zeroWindows} 次零窗口，均已通过Window Update恢复，可能为瞬时现象`,
+                detail: { zeroWindows: sd.zeroWindows, windowUpdates: sd.windowUpdates }
+              });
+            }
+          }
+
+          // 6. 异常 RST 断开：有 RST 但没有正常 FIN 交互（需双向流量 + 连接已建立）
+          if (sd.hasRst && !sd.hasFin && !sd.isUnidirectional && sd.synAckCount > 0) {
+            streamIssues.push({
+              type: 'ABNORMAL_RST',
+              severity: 'medium',
+              description: `连接已建立(synAckCount=${sd.synAckCount})后被RST强制断开，未经过正常的FIN四次挥手`,
+              detail: { rstCount: sd.rstCount, finCount: sd.finCount }
+            });
+          }
+
+          // 7. 四次挥手不完整：有 FIN 但握手不完整（需双向流量 + ACK回复验证）
+          if (sd.hasFin && !sd.isUnidirectional) {
+            if (sd.finCount < 2) {
+              streamIssues.push({
+                type: 'INCOMPLETE_TEARDOWN',
+                severity: 'low',
+                description: `仅检测到 ${sd.finCount} 个FIN包(四次挥手需要双向各发1个FIN共2个)，挥手可能不完整`,
+                detail: { finCount: sd.finCount, ackCount: sd.ackCount }
+              });
+            } else if (sd.ackCount < 2) {
+              streamIssues.push({
+                type: 'INCOMPLETE_TEARDOWN',
+                severity: 'low',
+                description: `检测到${sd.finCount}个FIN包但ACK回复仅${sd.ackCount}个(四次挥手每轮FIN需1个ACK应答)，挥手可能不完整`,
+                detail: { finCount: sd.finCount, ackCount: sd.ackCount }
+              });
+            }
+          }
+
+          // 8. 大量重复 ACK（可能丢包）
+          if (sd.duplicateAcks > 3) {
+            streamIssues.push({
+              type: 'DUPLICATE_ACKS',
+              severity: 'medium',
+              description: `检测到 ${sd.duplicateAcks} 次重复ACK，可能存在丢包`,
+              detail: { duplicateAcks: sd.duplicateAcks }
+            });
+          }
+
+          if (streamIssues.length > 0) {
+            issues.push({
+              streamIndex: idx,
+              packetCount: sd.totalPackets,
+              flagsSummary: {
+                SYN: sd.synCount, SYN_ACK: sd.synAckCount,
+                RST: sd.rstCount, FIN: sd.finCount, ACK: sd.ackCount
+              },
+              analysisMarkers: {
+                retransmissions: sd.retransmissions,
+                duplicateAcks: sd.duplicateAcks,
+                zeroWindows: sd.zeroWindows,
+                keepAlives: sd.keepAlives,
+                windowUpdates: sd.windowUpdates
+              },
+              detectedIssues: streamIssues
+            });
+          }
+        }
+
+        // ── Step 5: SYN Flood 统计检测 ──
+        const synOnlyStreams = streamIndices.filter(idx => {
+          const sd = streamData[idx];
+          return sd.synCount > 0 && sd.synAckCount === 0;
+        });
+        if (synOnlyStreams.length >= 10) {
+          // 统计源 IP 分布
+          const { stdout: synIpsOut } = await execFileAsync(tsharkPath, [
+            '-r', safePcapPath, '-T', 'fields', '-e', 'ip.src',
+            '-Y', `tcp.flags.syn == 1 && tcp.flags.ack == 0 && (${synOnlyStreams.map(n => `tcp.stream eq ${n}`).join(' || ')})`
+          ], {
+            maxBuffer: 10 * 1024 * 1024,
+            env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+          });
+          const ipCounts = {};
+          for (const ip of synIpsOut.split('\n').map(l => l.trim()).filter(Boolean)) {
+            ipCounts[ip] = (ipCounts[ip] || 0) + 1;
+          }
+          const topIp = Object.entries(ipCounts).sort((a, b) => b[1] - a[1])[0];
+          issues.push({
+            streamIndex: 'SYN_FLOOD_DETECTION',
+            packetCount: synOnlyStreams.length,
+            flagsSummary: {},
+            analysisMarkers: {},
+            detectedIssues: [{
+              type: 'SYN_FLOOD',
+              severity: 'critical',
+              description: `检测到 ${synOnlyStreams.length} 个SYN无响应流，疑似SYN Flood攻击`,
+              detail: {
+                synOnlyStreamCount: synOnlyStreams.length,
+                sourceIpDistribution: ipCounts,
+                topSourceIp: topIp ? `${topIp[0]} (${topIp[1]} SYNs)` : 'unknown'
+              }
+            }]
+          });
+        }
+
+        // ── 构建 JSON 响应 ──
+        const result = {
+          pcapPath,
+          filter: userFilter || null,
+          totalStreamsAnalyzed: streamIndices.length,
+          streamsWithIssues: issues.length,
+          issues,
+          summary: issues.length === 0
+            ? `分析了 ${streamIndices.length} 个TCP流，未发现四层网络问题。`
+            : `分析了 ${streamIndices.length} 个TCP流，发现 ${issues.length} 个流存在问题，共 ${issues.reduce((s, i) => s + i.detectedIssues.length, 0)} 个问题。`
+        };
+
+        // 输出截断保护：按比例裁剪 issues 数组，仅截断超出部分
+        let jsonOutput = JSON.stringify(result, null, 2);
+        const maxChars = 200000;
+        if (jsonOutput.length > maxChars) {
+          const trimFactor = maxChars / jsonOutput.length;
+          const truncatedResult = { ...result };
+          truncatedResult.issues = result.issues.slice(0, Math.floor(result.issues.length * trimFactor));
+          truncatedResult.summary += ' (输出已截断，部分流详情被省略)';
+          jsonOutput = JSON.stringify(truncatedResult, null, 2);
+        }
+
+        console.error(`[analyze_l4_network] 分析完成: ${issues.length}/${streamIndices.length} 个流存在问题`);
+        return {
+          content: [{ type: 'text', text: jsonOutput }],
+        };
+      } catch (error) {
+        console.error(`[analyze_l4_network] 执行错误: ${error.message}`);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: error.message }, null, 2) }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool 10: 分析七层（应用层）网络问题
+  server.tool(
+    'analyze_l7_network',
+    '分析PCAP文件中应用层网络问题。先用tshark过滤命中的数据包，找到关联的TCP流和DNS事务，再逐流/逐事务分析是否存在HTTP 4xx/5xx错误、重定向循环、响应极慢、Content-Length不匹配、服务端提前FIN、DNS查询失败、DNS解析超时等问题。返回JSON格式报告。',
+    {
+      pcapPath: z.string().describe('待分析的PCAP文件路径，例如：./demo.pcap'),
+      tsharkArgs: z.string().describe('tshark命令参数字符串，用于过滤目标数据包。支持 -Y 过滤表达式，例如：-Y "http" 或 -Y "ip.addr == 10.0.0.1"'),
+    },
+    async (args) => {
+      try {
+        const tsharkPath = await findTshark();
+        const { pcapPath, tsharkArgs } = args;
+        console.error(`[analyze_l7_network] 开始分析: pcapPath=${pcapPath}, tsharkArgs=${tsharkArgs}`);
+
+        const safePcapPath = await validatePcapPath(pcapPath);
+        const parsedArgs = parseTsharkArgs(tsharkArgs);
+
+        // 从用户参数中提取 -Y 过滤器（复用 L4 的安全解析逻辑）
+        let userFilter = null;
+        const cleanArgs = [];
+        for (let i = 0; i < parsedArgs.length; i++) {
+          if (parsedArgs[i] === '-Y' || parsedArgs[i] === '--display-filter') {
+            userFilter = parsedArgs[i + 1] || null;
+            i++;
+            continue;
+          }
+          if (parsedArgs[i] === '-T' || parsedArgs[i] === '-e' || parsedArgs[i] === '-r') {
+            i++;
+            continue;
+          }
+          if (parsedArgs[i].startsWith('-T') || parsedArgs[i].startsWith('-e') || parsedArgs[i].startsWith('-r')) continue;
+          cleanArgs.push(parsedArgs[i]);
+        }
+
+        // ── Step 1: 并行提取 TCP 流编号和 DNS 事务 ID ──
+        const getStreamsArgs = ['-r', safePcapPath, '-T', 'fields', '-e', 'tcp.stream'];
+        if (userFilter) getStreamsArgs.push('-Y', userFilter);
+
+        const getDnsIdArgs = ['-r', safePcapPath, '-T', 'fields', '-e', 'dns.id'];
+        if (userFilter) getDnsIdArgs.push('-Y', userFilter);
+
+        console.error(`[analyze_l7_network] Step1 提取流编号和DNS事务ID`);
+        const [{ stdout: streamsOut }, { stdout: dnsIdOut }] = await Promise.all([
+          execFileAsync(tsharkPath, getStreamsArgs, {
+            maxBuffer: 10 * 1024 * 1024,
+            env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+          }),
+          execFileAsync(tsharkPath, getDnsIdArgs, {
+            maxBuffer: 10 * 1024 * 1024,
+            env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+          })
+        ]);
+
+        const streamIndices = [...new Set(
+          streamsOut.split('\n')
+            .map(l => l.trim())
+            .filter(l => l !== '' && l !== '_')
+            .map(Number)
+            .filter(n => !isNaN(n))
+        )].sort((a, b) => a - b);
+
+        const dnsIds = [...new Set(
+          dnsIdOut.split('\n')
+            .map(l => l.trim())
+            .filter(l => l !== '')
+            .map(Number)
+            .filter(n => !isNaN(n))
+        )].sort((a, b) => a - b);
+
+        if (streamIndices.length === 0 && dnsIds.length === 0) {
+          const result = {
+            pcapPath,
+            filter: userFilter || null,
+            totalStreamsAnalyzed: 0,
+            totalDnsTransactionsAnalyzed: 0,
+            issues: [],
+            summary: '未找到匹配的TCP流或DNS事务，无法进行七层分析。请检查过滤条件或PCAP文件内容。'
+          };
+          return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        }
+        console.error(`[analyze_l7_network] 发现 ${streamIndices.length} 个TCP流, ${dnsIds.length} 个DNS事务`);
+
+        // ── Step 2: 并行批量查询 L7 数据 ──
+        const queryPromises = [];
+
+        // 查询 A: HTTP 请求/响应数据（仅在存在TCP流时执行）
+        if (streamIndices.length > 0) {
+          const streamFilter = streamIndices.map(n => `tcp.stream eq ${n}`).join(' || ');
+          const httpFilter = userFilter ? `http && (${streamFilter})` : `http && (${streamFilter})`;
+          queryPromises.push(
+            execFileAsync(tsharkPath, [
+              '-r', safePcapPath, '-T', 'fields',
+              '-e', 'tcp.stream', '-e', 'frame.time_epoch',
+              '-e', 'http.request.method', '-e', 'http.request.uri',
+              '-e', 'http.response.code', '-e', 'http.content_length',
+              '-e', 'ip.src',
+              '-Y', httpFilter
+            ], {
+              maxBuffer: 10 * 1024 * 1024,
+              env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+            })
+          );
+          // 查询 C: TCP FIN（HTTP流的服务端提前关闭检测，RST属于L4范畴不在此检测）
+          const finFilter = `tcp.flags.fin==1 && (${streamFilter})`;
+          queryPromises.push(
+            execFileAsync(tsharkPath, [
+              '-r', safePcapPath, '-T', 'fields',
+              '-e', 'tcp.stream', '-e', 'ip.src', '-e', 'frame.time_epoch',
+              '-Y', finFilter
+            ], {
+              maxBuffer: 10 * 1024 * 1024,
+              env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+            })
+          );
+          // 查询 D: TCP 重传标记（Content-Length不匹配检测辅助）
+          const retransFilter = `tcp.analysis.retransmission && (${streamFilter})`;
+          queryPromises.push(
+            execFileAsync(tsharkPath, [
+              '-r', safePcapPath, '-T', 'fields',
+              '-e', 'tcp.stream', '-e', 'tcp.analysis.retransmission',
+              '-Y', retransFilter
+            ], {
+              maxBuffer: 10 * 1024 * 1024,
+              env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+            })
+          );
+        }
+
+        // 查询 B: DNS 事务数据（仅在存在DNS事务时执行）
+        if (dnsIds.length > 0) {
+          const dnsIdFilter = dnsIds.map(n => `dns.id == ${n}`).join(' || ');
+          const combinedDnsFilter = userFilter ? `dns && (${dnsIdFilter})` : `dns && (${dnsIdFilter})`;
+          queryPromises.push(
+            execFileAsync(tsharkPath, [
+              '-r', safePcapPath, '-T', 'fields',
+              '-e', 'dns.id', '-e', 'frame.time_epoch',
+              '-e', 'dns.qry.name', '-e', 'dns.flags.rcode',
+              '-e', 'dns.flags.response', '-e', 'dns.time',
+              '-Y', combinedDnsFilter
+            ], {
+              maxBuffer: 10 * 1024 * 1024,
+              env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+            })
+          );
+        }
+
+        const queryResults = await Promise.all(queryPromises);
+
+        // 解包查询结果（根据是否有TCP流和DNS事务确定偏移）
+        let httpOut = '', finRstOut = '', retransOut = '', dnsOut = '';
+        let resultIdx = 0;
+        if (streamIndices.length > 0) {
+          httpOut = queryResults[resultIdx++].stdout;
+          finRstOut = queryResults[resultIdx++].stdout;
+          retransOut = queryResults[resultIdx++].stdout;
+        }
+        if (dnsIds.length > 0) {
+          dnsOut = queryResults[resultIdx].stdout;
+        }
+
+        // ── Step 3: 解析数据，按流/事务分组 ──
+
+        // HTTP 流数据
+        const httpStreamData = {};
+        for (const idx of streamIndices) {
+          httpStreamData[idx] = {
+            streamIndex: idx,
+            packets: [],     // 按时间排序的 HTTP 请求/响应序列
+            srcIps: new Set(),
+            finEvents: [],   // { time, srcIp }
+            hasFin: false,
+            retransmissions: 0,
+            totalHttpRequests: 0,
+            totalHttpResponses: 0
+          };
+        }
+
+        // 解析 HTTP 请求/响应数据
+        for (const line of httpOut.split('\n')) {
+          if (!line.trim()) continue;
+          const [streamStr, timeStr, method, uri, respCode, contentLength, srcIp] = line.split('\t');
+          const streamIdx = parseInt(streamStr);
+          if (isNaN(streamIdx) || !httpStreamData[streamIdx]) continue;
+          const hd = httpStreamData[streamIdx];
+          hd.srcIps.add(srcIp);
+          const entry = { time: parseFloat(timeStr), srcIp };
+          if (method) {
+            entry.type = 'request';
+            entry.method = method;
+            entry.uri = uri || '';
+            hd.totalHttpRequests++;
+          } else if (respCode) {
+            entry.type = 'response';
+            entry.code = parseInt(respCode);
+            entry.contentLength = contentLength ? parseInt(contentLength) : null;
+            hd.totalHttpResponses++;
+          } else {
+            continue; // 非 HTTP 请求/响应行，跳过
+          }
+          hd.packets.push(entry);
+        }
+
+        // 按时间排序每个流的 HTTP 包序列
+        for (const idx of streamIndices) {
+          httpStreamData[idx].packets.sort((a, b) => a.time - b.time);
+        }
+
+        // 解析 FIN 数据（含时间戳，用于时序分析）
+        for (const line of finRstOut.split('\n')) {
+          if (!line.trim()) continue;
+          const [streamStr, srcIp, timeStr] = line.split('\t');
+          const streamIdx = parseInt(streamStr);
+          if (isNaN(streamIdx) || !httpStreamData[streamIdx]) continue;
+          const hd = httpStreamData[streamIdx];
+          hd.hasFin = true;
+          hd.finEvents.push({ time: parseFloat(timeStr) || 0, srcIp });
+        }
+        // 按 FIN 事件时间排序
+        for (const idx of streamIndices) {
+          httpStreamData[idx].finEvents.sort((a, b) => a.time - b.time);
+        }
+
+        // 解析重传标记
+        for (const line of retransOut.split('\n')) {
+          if (!line.trim()) continue;
+          const [streamStr] = line.split('\t');
+          const streamIdx = parseInt(streamStr);
+          if (isNaN(streamIdx) || !httpStreamData[streamIdx]) continue;
+          httpStreamData[streamIdx].retransmissions++;
+        }
+
+        // DNS 事务数据
+        const dnsTransData = {};
+        for (const id of dnsIds) {
+          dnsTransData[id] = {
+            dnsId: id,
+            queryName: null,
+            rcode: null,
+            hasQuery: false,
+            hasResponse: false,
+            queryTime: null,
+            responseTime: null,
+            dnsTime: null
+          };
+        }
+
+        for (const line of dnsOut.split('\n')) {
+          if (!line.trim()) continue;
+          const [idStr, timeStr, qryName, rcode, isResponse, dnsTime] = line.split('\t');
+          const dnsId = parseInt(idStr);
+          if (isNaN(dnsId) || !dnsTransData[dnsId]) continue;
+          const dd = dnsTransData[dnsId];
+          if (isResponse === '1') {
+            dd.hasResponse = true;
+            dd.responseTime = parseFloat(timeStr);
+            dd.rcode = rcode ? parseInt(rcode) : 0;
+            dd.dnsTime = dnsTime ? parseFloat(dnsTime) : null;
+          } else {
+            dd.hasQuery = true;
+            dd.queryTime = parseFloat(timeStr);
+            if (qryName) dd.queryName = qryName;
+          }
+        }
+
+        // ── Step 4: 问题检测 ──
+        const issues = [];
+
+        // HTTP 流检测
+        for (const idx of streamIndices) {
+          const hd = httpStreamData[idx];
+          if (hd.packets.length === 0) continue; // 该流无 HTTP 数据，跳过
+          const streamIssues = [];
+          const isUnidirectional = hd.srcIps.size === 1;
+
+          // 1. HTTP 4xx 错误
+          const codes4xx = hd.packets.filter(p => p.type === 'response' && p.code >= 400 && p.code < 500);
+          if (codes4xx.length > 0) {
+            streamIssues.push({
+              type: 'HTTP_4XX_ERROR',
+              severity: 'medium',
+              description: `检测到 ${codes4xx.length} 个HTTP 4xx错误响应`,
+              detail: { count: codes4xx.length, codes: [...new Set(codes4xx.map(p => p.code))] }
+            });
+          }
+
+          // 2. HTTP 5xx 错误
+          const codes5xx = hd.packets.filter(p => p.type === 'response' && p.code >= 500 && p.code < 600);
+          if (codes5xx.length > 0) {
+            streamIssues.push({
+              type: 'HTTP_5XX_ERROR',
+              severity: 'high',
+              description: `检测到 ${codes5xx.length} 个HTTP 5xx服务器错误响应`,
+              detail: { count: codes5xx.length, codes: [...new Set(codes5xx.map(p => p.code))] }
+            });
+          }
+
+          // 3. HTTP 重定向循环：同一流内连续出现 ≥3 次 3xx 重定向响应
+          if (!isUnidirectional) {
+            const respSequence = hd.packets.filter(p => p.type === 'response').map(p => p.code);
+            let maxConsecutiveRedirects = 0;
+            let currentConsecutive = 0;
+            for (const code of respSequence) {
+              if (code >= 300 && code < 400) {
+                currentConsecutive++;
+                if (currentConsecutive > maxConsecutiveRedirects) maxConsecutiveRedirects = currentConsecutive;
+              } else {
+                currentConsecutive = 0;
+              }
+            }
+            if (maxConsecutiveRedirects >= 3) {
+              streamIssues.push({
+                type: 'HTTP_REDIRECT_LOOP',
+                severity: 'high',
+                description: `同一流内连续出现 ${maxConsecutiveRedirects} 次3xx重定向响应，疑似重定向循环`,
+                detail: { consecutiveRedirects: maxConsecutiveRedirects }
+              });
+            }
+          }
+
+          // 4. HTTP 响应极慢：请求到响应时间差 > 30s
+          if (!isUnidirectional) {
+            let maxSlowTime = 0;
+            const slowPairs = [];
+            // 找每个请求之后的第一个响应
+            for (let i = 0; i < hd.packets.length; i++) {
+              if (hd.packets[i].type !== 'request') continue;
+              const reqTime = hd.packets[i].time;
+              // 向后查找最近的响应
+              for (let j = i + 1; j < hd.packets.length; j++) {
+                if (hd.packets[j].type === 'response') {
+                  const elapsed = hd.packets[j].time - reqTime;
+                  if (elapsed > 30) {
+                    slowPairs.push({ request: hd.packets[i].uri, elapsed: elapsed.toFixed(2) });
+                    if (elapsed > maxSlowTime) maxSlowTime = elapsed;
+                  }
+                  break;
+                }
+              }
+            }
+            if (slowPairs.length > 0) {
+              streamIssues.push({
+                type: 'HTTP_SLOW_RESPONSE',
+                severity: 'medium',
+                description: `检测到 ${slowPairs.length} 个HTTP响应耗时超过30秒(最长${maxSlowTime.toFixed(2)}秒)`,
+                detail: { count: slowPairs.length, maxElapsed: maxSlowTime.toFixed(2), samples: slowPairs.slice(0, 5) }
+              });
+            }
+          }
+
+          // 5. HTTP Content-Length 不匹配：响应声明了 Content-Length 且同流存在重传 + 服务端FIN，响应体可能不完整
+          const responsesWithContentLength = hd.packets.filter(p => p.type === 'response' && p.contentLength !== null && p.contentLength > 0);
+          if (responsesWithContentLength.length > 0 && hd.retransmissions > 0 && hd.hasFin) {
+            streamIssues.push({
+              type: 'HTTP_CONTENT_LENGTH_MISMATCH',
+              severity: 'high',
+              description: `HTTP响应声明了Content-Length但同流存在${hd.retransmissions}次重传且服务端已发FIN，响应体可能不完整`,
+              detail: { retransmissions: hd.retransmissions, contentLengthResponses: responsesWithContentLength.length }
+            });
+          }
+
+          // 6. 服务端提前 FIN：基于时序判断服务端是否在请求未完成时关闭连接
+          if (hd.hasFin && !isUnidirectional) {
+            // 识别服务端 IP：流中只发送 HTTP 响应的 IP 视为服务端
+            const responseSrcIps = new Set(
+              hd.packets.filter(p => p.type === 'response').map(p => p.srcIp)
+            );
+            // 找出服务端发出的 FIN 事件
+            const serverFinEvents = hd.finEvents.filter(e => responseSrcIps.has(e.srcIp));
+            if (serverFinEvents.length > 0) {
+              // 取第一个服务端 FIN 时间点
+              const firstFinTime = serverFinEvents[0].time;
+
+              // 基于时序判断：在 FIN 之前发出的请求，如果在 FIN 之后仍未收到响应 → 被中断
+              const affectedRequests = [];
+              for (let i = 0; i < hd.packets.length; i++) {
+                const pkt = hd.packets[i];
+                if (pkt.type !== 'request' || pkt.time >= firstFinTime) continue;
+                // 向后查找该请求是否在 FIN 之前收到了响应
+                let hasResponseBeforeFin = false;
+                for (let j = i + 1; j < hd.packets.length; j++) {
+                  const next = hd.packets[j];
+                  if (next.type === 'response' && next.time < firstFinTime) {
+                    hasResponseBeforeFin = true;
+                    break;
+                  }
+                  if (next.time >= firstFinTime) break;
+                }
+                if (!hasResponseBeforeFin) {
+                  affectedRequests.push({ method: pkt.method, uri: pkt.uri, requestTime: pkt.time.toFixed(3) });
+                }
+              }
+
+              if (affectedRequests.length > 0) {
+                const severity = 'high';
+                streamIssues.push({
+                  type: 'SERVER_PREMATURE_FIN',
+                  severity,
+                  description: `服务端(${[...responseSrcIps].join(',')})在 ${firstFinTime.toFixed(3)}s 发送FIN，有 ${affectedRequests.length} 个已发出请求未在FIN前收到响应，连接被提前关闭`,
+                  detail: {
+                    serverIp: [...responseSrcIps],
+                    finTime: firstFinTime.toFixed(3),
+                    affectedRequestCount: affectedRequests.length,
+                    affectedRequests: affectedRequests.slice(0, 10)
+                  }
+                });
+              }
+            }
+          }
+
+          if (streamIssues.length > 0) {
+            issues.push({
+              streamIndex: idx,
+              protocol: 'HTTP',
+              packetCount: hd.packets.length,
+              detectedIssues: streamIssues
+            });
+          }
+        }
+
+        // DNS 事务检测
+        for (const id of dnsIds) {
+          const dd = dnsTransData[id];
+          const dnsIssues = [];
+
+          // 7. DNS NXDOMAIN
+          if (dd.hasResponse && dd.rcode === 3) {
+            dnsIssues.push({
+              type: 'DNS_NXDOMAIN',
+              severity: 'medium',
+              description: `DNS查询 ${dd.queryName || 'unknown'} 返回NXDOMAIN，域名不存在`,
+              detail: { queryName: dd.queryName, rcode: dd.rcode }
+            });
+          }
+
+          // 8. DNS SERVFAIL
+          if (dd.hasResponse && dd.rcode === 2) {
+            dnsIssues.push({
+              type: 'DNS_SERVFAIL',
+              severity: 'high',
+              description: `DNS查询 ${dd.queryName || 'unknown'} 返回SERVFAIL，DNS服务器故障`,
+              detail: { queryName: dd.queryName, rcode: dd.rcode }
+            });
+          }
+
+          // 9. DNS REFUSED
+          if (dd.hasResponse && dd.rcode === 5) {
+            dnsIssues.push({
+              type: 'DNS_REFUSED',
+              severity: 'high',
+              description: `DNS查询 ${dd.queryName || 'unknown'} 返回REFUSED，DNS服务器拒绝查询`,
+              detail: { queryName: dd.queryName, rcode: dd.rcode }
+            });
+          }
+
+          // 10. DNS 超时：有查询无响应
+          if (dd.hasQuery && !dd.hasResponse) {
+            dnsIssues.push({
+              type: 'DNS_TIMEOUT',
+              severity: 'high',
+              description: `DNS查询 ${dd.queryName || 'unknown'} 未收到响应，可能超时`,
+              detail: { queryName: dd.queryName, dnsId: dd.dnsId }
+            });
+          }
+
+          if (dnsIssues.length > 0) {
+            issues.push({
+              streamIndex: `dns:${id}`,
+              protocol: 'DNS',
+              packetCount: (dd.hasQuery ? 1 : 0) + (dd.hasResponse ? 1 : 0),
+              detectedIssues: dnsIssues
+            });
+          }
+        }
+
+        // ── 构建 JSON 响应 ──
+        const result = {
+          pcapPath,
+          filter: userFilter || null,
+          totalStreamsAnalyzed: streamIndices.length,
+          totalDnsTransactionsAnalyzed: dnsIds.length,
+          streamsWithIssues: issues.length,
+          issues,
+          summary: issues.length === 0
+            ? `分析了 ${streamIndices.length} 个TCP流和 ${dnsIds.length} 个DNS事务，未发现七层网络问题。`
+            : `分析了 ${streamIndices.length} 个TCP流和 ${dnsIds.length} 个DNS事务，发现 ${issues.length} 个流/事务存在问题，共 ${issues.reduce((s, i) => s + i.detectedIssues.length, 0)} 个问题。`
+        };
+
+        // 输出截断保护：按比例裁剪 issues 数组，仅截断超出部分
+        let jsonOutput = JSON.stringify(result, null, 2);
+        const maxChars = 200000;
+        if (jsonOutput.length > maxChars) {
+          const trimFactor = maxChars / jsonOutput.length;
+          const truncatedResult = { ...result };
+          truncatedResult.issues = result.issues.slice(0, Math.floor(result.issues.length * trimFactor));
+          truncatedResult.summary += ' (输出已截断，部分流详情被省略)';
+          jsonOutput = JSON.stringify(truncatedResult, null, 2);
+        }
+
+        console.error(`[analyze_l7_network] 分析完成: ${issues.length} 个流/事务存在问题`);
+        return {
+          content: [{ type: 'text', text: jsonOutput }],
+        };
+      } catch (error) {
+        console.error(`[analyze_l7_network] 执行错误: ${error.message}`);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: error.message }, null, 2) }],
+          isError: true
+        };
       }
     }
   );

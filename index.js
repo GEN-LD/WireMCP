@@ -73,6 +73,20 @@ async function validatePcapPath(p) {
 }
 
 /**
+ * 校验 SSLKEYLOGFILE 路径
+ * 规范化为绝对路径，禁止路径穿越（包含 ".."），并检查文件是否存在
+ * 允许 .txt、.log 或无扩展名的常见 keylog 文件
+ */
+async function validateKeylogPath(p) {
+  if (typeof p !== 'string' || p.includes('..') || p.includes('\0')) {
+    throw new Error(`非法的文件路径: "${p}"。路径中不允许包含 ".." 或空字符。`);
+  }
+  const resolved = path.resolve(p);
+  await fs.access(resolved);
+  return resolved;
+}
+
+/**
  * 解码 tshark 输出中的十六进制字段
  * tshark -T fields 模式下，二进制类型字段（如 http.file_data、tcp.payload）输出为十六进制字符串
  * 大模型无法直接理解长 hex 串，需要自动解码为可读文本
@@ -86,6 +100,9 @@ async function validatePcapPath(p) {
  * @param {string} output - tshark 原始输出
  * @returns {string} 解码后的输出
  */
+// 分批查询阈值：单次 tshark 调用最多包含的流/事务数量，避免 spawn E2BIG（ARGS 超长）
+const MAX_BATCH_SIZE = 200;
+
 function decodeHexFields(output) {
   const HEX_MIN_LENGTH = 8;
   const PRINTABLE_RATIO_THRESHOLD = 0.8;
@@ -155,15 +172,6 @@ function validateTsharkArgs(args) {
         '使用 -V 查看完整协议解码详情',
         '使用 -z io,phs 生成协议层级统计报告',
         '使用 -z follow,tcp,ascii,0 追踪 TCP 流内容'
-      ]
-    },
-    '-o': {
-      patterns: ['-o', '--override-prefs'],
-      reason: '可能覆盖关键偏好设置导致非预期行为或安全策略绕过',
-      alternatives: [
-        '使用 -Y "<filter>" 精确控制显示内容范围',
-        '使用 -O <protocol> 仅详细显示指定协议（如 -O http）',
-        '使用 -T fields -e <field> 精确提取所需字段，避免多余输出'
       ]
     },
     '-C': {
@@ -293,6 +301,19 @@ function validateTsharkArgs(args) {
             `  • tcp.port == 80 && http.host contains "example"\n` +
             `  • dns.qry.name matches ".*\\.example\\.com"\n` +
             `  • frame.len > 1000`
+          );
+        }
+      }
+    }
+    // 【安全拦截】-o 参数允许设置tshark偏好，但禁止加载Lua脚本等危险偏好
+    if (args[i] === '-o' || args[i] === '--override-prefs') {
+      if (i + 1 < args.length) {
+        const prefValue = args[i + 1];
+        if (typeof prefValue === 'string' && /\blua\b/i.test(prefValue)) {
+          throw new Error(
+            `【安全拦截】检测到 -o 参数试图设置Lua相关偏好 "${prefValue}"。\n` +
+            `风险说明：-o lua.* 可加载Lua脚本，存在代码执行风险。\n` +
+            `请移除Lua相关偏好设置，或使用其他合法参数完成分析。`
           );
         }
       }
@@ -652,25 +673,49 @@ server.tool(
       // 自动检测hex字段并解码为可读文本，二进制数据保留原始hex并标注[binary data]
       let output = decodeHexFields(stdout);
 
-      // 【输出大小限制】防止超大数据量导致LLM上下文溢出，超过720K字符时自动截断
-      const maxChars = 720000;
-      if (output.length > maxChars) {
-        const originalLength = output.length;
-        output = output.slice(0, maxChars) + '\n... [输出已截断，数据量超过上下文限制]';
-        console.error(`输出已从 ${originalLength} 字符截断到 ${maxChars} 字符`);
+      // 【JSON结构化输出】构建结果对象，方便LLM解析和分析
+      const command = `tshark -r ${pcapPath} ${tsharkArgs}`;
+      const result = {
+        pcapPath,
+        command,
+        output,
+        truncated: false,
+        analysisPrompt: [
+          `你执行了自定义tshark命令: ${command}`,
+          '请根据上述output字段中的输出数据进行网络流量分析：',
+          '  - 识别异常通信模式（如异常连接频率、非标准端口通信、可疑IP地址）',
+          '  - 分析协议特征（如异常协议使用、畸形请求/响应）',
+          '  - 检测敏感信息泄露（如明文密码、令牌、内部路径）',
+          '  - 发现安全攻击行为（如扫描探测、注入尝试、C2通信）',
+          output.trim() === ''
+            ? '注意：tshark输出为空，可能过滤条件过严或无匹配数据包，请检查过滤表达式是否正确。'
+            : null
+        ].filter(Boolean).join('\n')
+      };
+
+      // 【输出截断保护】参考 analyze_l4/l7 截断模式，按比例裁剪output字符串
+      let jsonOutput = JSON.stringify(result, null, 2);
+      const maxChars = 200000;
+      if (jsonOutput.length > maxChars) {
+        const trimFactor = maxChars / jsonOutput.length;
+        const truncatedResult = { ...result };
+        truncatedResult.output = result.output.slice(0, Math.floor(result.output.length * trimFactor));
+        truncatedResult.truncated = true;
+        truncatedResult.originalLength = result.output.length;
+        truncatedResult.analysisPrompt += ' (原始输出已截断，仅保留部分内容，建议缩小过滤范围以获取完整数据)';
+        jsonOutput = JSON.stringify(truncatedResult, null, 2);
+        console.error(`exec_tshark输出已从 ${result.output.length} 字符按比例截断到 ${truncatedResult.output.length} 字符`);
       }
 
-      // 【结果格式化】整理输出信息，方便LLM分析使用
-      const outputText = `执行的tshark命令: tshark -r ${pcapPath} ${tsharkArgs}\n\n` +
-        `分析结果:\n${output}\n\n` +
-        `【分析提示】请根据上述输出数据进行网络流量分析，识别异常通信模式、协议特征、敏感信息泄露或安全攻击行为。`;
-
       return {
-        content: [{ type: 'text', text: outputText }],
+        content: [{ type: 'text', text: jsonOutput }],
       };
     } catch (error) {
       console.error(`exec_tshark执行错误: ${error.message}`);
-      return { content: [{ type: 'text', text: `执行错误: ${error.message}` }], isError: true };
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: error.message }, null, 2) }],
+        isError: true
+      };
     }
   }
 );
@@ -965,31 +1010,40 @@ server.tool(
         }
         console.error(`[analyze_l4_network] 发现 ${streamIndices.length} 个TCP流: [${streamIndices.join(', ')}]`);
 
-        // ── Step 2: 逐流批量查询（使用 tshark -z 支持多流统计，减少调用次数）──
-        const streamFilter = streamIndices.map(n => `tcp.stream eq ${n}`).join(' || ');
-        const combinedFilter = userFilter ? `(${userFilter}) && (${streamFilter})` : streamFilter;
+        // ── Step 2: 逐流批量查询（分批避免流过多导致 spawn E2BIG）──
+        const l4Env = { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` };
+        let flagsOut = '';
+        let analysisOut = '';
 
-        // 查询 A: 每个流的 TCP flags 汇总
-        const { stdout: flagsOut } = await execFileAsync(tsharkPath, [
-          '-r', safePcapPath, '-T', 'fields',
-          '-e', 'tcp.stream', '-e', 'tcp.flags', '-e', 'ip.src',
-          '-Y', combinedFilter
-        ], {
-          maxBuffer: 10 * 1024 * 1024,
-          env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
-        });
+        for (let bi = 0; bi < streamIndices.length; bi += MAX_BATCH_SIZE) {
+          const batch = streamIndices.slice(bi, bi + MAX_BATCH_SIZE);
+          const streamFilter = batch.map(n => `tcp.stream eq ${n}`).join(' || ');
+          const batchFilter = userFilter ? `(${userFilter}) && (${streamFilter})` : streamFilter;
 
-        // 查询 B: 每个流的 TCP 分析标记
-        const { stdout: analysisOut } = await execFileAsync(tsharkPath, [
-          '-r', safePcapPath, '-T', 'fields',
-          '-e', 'tcp.stream', '-e', 'tcp.analysis.retransmission',
-          '-e', 'tcp.analysis.duplicate_ack', '-e', 'tcp.analysis.zero_window',
-          '-e', 'tcp.analysis.keep_alive', '-e', 'tcp.analysis.window_update',
-          '-Y', combinedFilter
-        ], {
-          maxBuffer: 10 * 1024 * 1024,
-          env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
-        });
+          // 查询 A: 每个流的 TCP flags 汇总
+          const { stdout: fOut } = await execFileAsync(tsharkPath, [
+            '-r', safePcapPath, '-T', 'fields',
+            '-e', 'tcp.stream', '-e', 'tcp.flags', '-e', 'ip.src',
+            '-Y', batchFilter
+          ], {
+            maxBuffer: 10 * 1024 * 1024,
+            env: l4Env
+          });
+          flagsOut += (flagsOut ? '\n' : '') + fOut;
+
+          // 查询 B: 每个流的 TCP 分析标记
+          const { stdout: aOut } = await execFileAsync(tsharkPath, [
+            '-r', safePcapPath, '-T', 'fields',
+            '-e', 'tcp.stream', '-e', 'tcp.analysis.retransmission',
+            '-e', 'tcp.analysis.duplicate_ack', '-e', 'tcp.analysis.zero_window',
+            '-e', 'tcp.analysis.keep_alive', '-e', 'tcp.analysis.window_update',
+            '-Y', batchFilter
+          ], {
+            maxBuffer: 10 * 1024 * 1024,
+            env: l4Env
+          });
+          analysisOut += (analysisOut ? '\n' : '') + aOut;
+        }
 
         // ── Step 3: 解析数据，按流分组 ──
         const streamData = {};
@@ -1285,8 +1339,8 @@ server.tool(
         const parsedArgs = parseTsharkArgs(tsharkArgs);
 
         // 从用户参数中提取 -Y 过滤器（复用 L4 的安全解析逻辑）
+        // 注意：-T、-e、-r 等格式/字段参数与工具自身的硬编码查询不兼容，直接跳过
         let userFilter = null;
-        const cleanArgs = [];
         for (let i = 0; i < parsedArgs.length; i++) {
           if (parsedArgs[i] === '-Y' || parsedArgs[i] === '--display-filter') {
             userFilter = parsedArgs[i + 1] || null;
@@ -1298,7 +1352,6 @@ server.tool(
             continue;
           }
           if (parsedArgs[i].startsWith('-T') || parsedArgs[i].startsWith('-e') || parsedArgs[i].startsWith('-r')) continue;
-          cleanArgs.push(parsedArgs[i]);
         }
 
         // ── Step 1: 并行提取 TCP 流编号和 DNS 事务 ID ──
@@ -1349,154 +1402,226 @@ server.tool(
         }
         console.error(`[analyze_l7_network] 发现 ${streamIndices.length} 个TCP流, ${dnsIds.length} 个DNS事务`);
 
-        // ── Step 2: 并行批量查询 L7 数据 ──
+        // ── Step 2: 并行批量查询 ──
         const queryPromises = [];
 
-        // 查询 A: HTTP 请求/响应数据（仅在存在TCP流时执行）
+        // TCP: 分批查询 — 避免流过多导致 spawn E2BIG
         if (streamIndices.length > 0) {
-          const streamFilter = streamIndices.map(n => `tcp.stream eq ${n}`).join(' || ');
-          const httpFilter = userFilter ? `http && (${streamFilter})` : `http && (${streamFilter})`;
+          const l7Env = { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` };
           queryPromises.push(
-            execFileAsync(tsharkPath, [
-              '-r', safePcapPath, '-T', 'fields',
-              '-e', 'tcp.stream', '-e', 'frame.time_epoch',
-              '-e', 'http.request.method', '-e', 'http.request.uri',
-              '-e', 'http.response.code', '-e', 'http.content_length',
-              '-e', 'ip.src',
-              '-Y', httpFilter
-            ], {
-              maxBuffer: 10 * 1024 * 1024,
-              env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
-            })
-          );
-          // 查询 C: TCP FIN（HTTP流的服务端提前关闭检测，RST属于L4范畴不在此检测）
-          const finFilter = `tcp.flags.fin==1 && (${streamFilter})`;
-          queryPromises.push(
-            execFileAsync(tsharkPath, [
-              '-r', safePcapPath, '-T', 'fields',
-              '-e', 'tcp.stream', '-e', 'ip.src', '-e', 'frame.time_epoch',
-              '-Y', finFilter
-            ], {
-              maxBuffer: 10 * 1024 * 1024,
-              env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
-            })
-          );
-          // 查询 D: TCP 重传标记（Content-Length不匹配检测辅助）
-          const retransFilter = `tcp.analysis.retransmission && (${streamFilter})`;
-          queryPromises.push(
-            execFileAsync(tsharkPath, [
-              '-r', safePcapPath, '-T', 'fields',
-              '-e', 'tcp.stream', '-e', 'tcp.analysis.retransmission',
-              '-Y', retransFilter
-            ], {
-              maxBuffer: 10 * 1024 * 1024,
-              env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
-            })
+            (async () => {
+              let allOut = '';
+              for (let bi = 0; bi < streamIndices.length; bi += MAX_BATCH_SIZE) {
+                const batch = streamIndices.slice(bi, bi + MAX_BATCH_SIZE);
+                const tcpFilter = batch.map(n => `tcp.stream eq ${n}`).join(' || ');
+                const { stdout } = await execFileAsync(tsharkPath, [
+                  '-r', safePcapPath, '-T', 'fields',
+                  '-e', 'tcp.stream', '-e', 'tcp.flags', '-e', 'ip.src',
+                  '-e', 'frame.time_epoch',
+                  '-e', 'http.request.method', '-e', 'http.request.uri',
+                  '-e', 'http.response.code', '-e', 'http.content_length',
+                  '-e', 'tcp.analysis.retransmission',
+                  '-Y', tcpFilter
+                ], {
+                  maxBuffer: 10 * 1024 * 1024,
+                  env: l7Env
+                });
+                allOut += (allOut ? '\n' : '') + stdout;
+              }
+              return { stdout: allOut };
+            })()
           );
         }
 
-        // 查询 B: DNS 事务数据（仅在存在DNS事务时执行）
+        // DNS: 分批查询 — 避免DNS事务过多导致 spawn E2BIG
         if (dnsIds.length > 0) {
-          const dnsIdFilter = dnsIds.map(n => `dns.id == ${n}`).join(' || ');
-          const combinedDnsFilter = userFilter ? `dns && (${dnsIdFilter})` : `dns && (${dnsIdFilter})`;
+          const l7Env = { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` };
           queryPromises.push(
-            execFileAsync(tsharkPath, [
-              '-r', safePcapPath, '-T', 'fields',
-              '-e', 'dns.id', '-e', 'frame.time_epoch',
-              '-e', 'dns.qry.name', '-e', 'dns.flags.rcode',
-              '-e', 'dns.flags.response', '-e', 'dns.time',
-              '-Y', combinedDnsFilter
-            ], {
-              maxBuffer: 10 * 1024 * 1024,
-              env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
-            })
+            (async () => {
+              let allOut = '';
+              for (let bi = 0; bi < dnsIds.length; bi += MAX_BATCH_SIZE) {
+                const batch = dnsIds.slice(bi, bi + MAX_BATCH_SIZE);
+                const dnsIdFilter = batch.map(n => `dns.id == ${n}`).join(' || ');
+                const combinedDnsFilter = `dns && (${dnsIdFilter})`;
+                const { stdout } = await execFileAsync(tsharkPath, [
+                  '-r', safePcapPath, '-T', 'fields',
+                  '-e', 'dns.id', '-e', 'frame.time_epoch',
+                  '-e', 'dns.qry.name', '-e', 'dns.flags.rcode',
+                  '-e', 'dns.flags.response', '-e', 'dns.time',
+                  '-Y', combinedDnsFilter
+                ], {
+                  maxBuffer: 10 * 1024 * 1024,
+                  env: l7Env
+                });
+                allOut += (allOut ? '\n' : '') + stdout;
+              }
+              return { stdout: allOut };
+            })()
+          );
+        }
+
+        // TLS: 查询TLS握手流和TLS Application Data（用于辅助判断提前FIN误报）
+        // 查询A：哪些TCP流包含TLS握手
+        const tlsHandshakePromise = execFileAsync(tsharkPath, [
+          '-r', safePcapPath, '-T', 'fields',
+          '-e', 'tcp.stream',
+          '-Y', 'tls.handshake'
+        ], {
+          maxBuffer: 10 * 1024 * 1024,
+          env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }
+        });
+
+        // 查询B：TLS Application Data包（先发查询A获取TLS流列表，再构建流过滤）
+        const { stdout: tlsHandshakeOut } = await tlsHandshakePromise;
+        const tlsStreamSet = new Set(
+          tlsHandshakeOut.split('\n')
+            .map(l => l.trim())
+            .filter(l => l !== '' && l !== '_')
+            .map(Number)
+            .filter(n => !isNaN(n))
+        );
+        const tlsStreamIndices = [...tlsStreamSet].sort((a, b) => a - b);
+        const tlsStreamFiltered = tlsStreamIndices.filter(n => streamIndices.includes(n));
+        let hasTlsQuery = false;
+        if (tlsStreamFiltered.length > 0) {
+          hasTlsQuery = true;
+          const l7Env = { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` };
+          queryPromises.push(
+            (async () => {
+              let allOut = '';
+              for (let bi = 0; bi < tlsStreamFiltered.length; bi += MAX_BATCH_SIZE) {
+                const batch = tlsStreamFiltered.slice(bi, bi + MAX_BATCH_SIZE);
+                const tlsAppDataFilter = batch.map(n => `tcp.stream eq ${n}`).join(' || ');
+                const { stdout } = await execFileAsync(tsharkPath, [
+                  '-r', safePcapPath, '-T', 'fields',
+                  '-e', 'tcp.stream', '-e', 'frame.time_epoch', '-e', 'ip.src',
+                  '-Y', `tls.app_data && (${tlsAppDataFilter})`
+                ], {
+                  maxBuffer: 10 * 1024 * 1024,
+                  env: l7Env
+                });
+                allOut += (allOut ? '\n' : '') + stdout;
+              }
+              return { stdout: allOut };
+            })()
           );
         }
 
         const queryResults = await Promise.all(queryPromises);
 
-        // 解包查询结果（根据是否有TCP流和DNS事务确定偏移）
-        let httpOut = '', finRstOut = '', retransOut = '', dnsOut = '';
+        // 解包：根据是否有TCP流、DNS事务、TLS查询确定顺序
+        // 入队顺序：TCP(可选) → DNS(可选) → TLS App Data(可选)
+        let tcpOut = '', dnsOut = '', tlsAppDataOut = '';
         let resultIdx = 0;
-        if (streamIndices.length > 0) {
-          httpOut = queryResults[resultIdx++].stdout;
-          finRstOut = queryResults[resultIdx++].stdout;
-          retransOut = queryResults[resultIdx++].stdout;
-        }
-        if (dnsIds.length > 0) {
-          dnsOut = queryResults[resultIdx].stdout;
-        }
+        if (streamIndices.length > 0) tcpOut = queryResults[resultIdx++].stdout;
+        if (dnsIds.length > 0) dnsOut = queryResults[resultIdx++].stdout;
+        if (hasTlsQuery) tlsAppDataOut = queryResults[resultIdx++].stdout;
 
         // ── Step 3: 解析数据，按流/事务分组 ──
 
-        // HTTP 流数据
-        const httpStreamData = {};
+        // TCP 流数据（包含流内所有包：TCP控制包 + HTTP应用包）
+        const streamData = {};
         for (const idx of streamIndices) {
-          httpStreamData[idx] = {
+          streamData[idx] = {
             streamIndex: idx,
-            packets: [],     // 按时间排序的 HTTP 请求/响应序列
+            packets: [],     // 流内所有 TCP 包（按时间排序）
             srcIps: new Set(),
-            finEvents: [],   // { time, srcIp }
+            finEvents: [],   // { time, srcIp }，从 tcp.flags hex 提取
+            rstEvents: [],   // { time, srcIp }，从 tcp.flags hex 提取
             hasFin: false,
             retransmissions: 0,
             totalHttpRequests: 0,
-            totalHttpResponses: 0
+            totalHttpResponses: 0,
+            isTls: false,              // 该流是否存在 TLS 握手
+            tlsAppDataEvents: []       // [{ time, srcIp }] 加密的 TLS 应用数据
           };
         }
 
-        // 解析 HTTP 请求/响应数据
-        for (const line of httpOut.split('\n')) {
+        // 统一解析：单次遍历完成 TCP flags / HTTP / 重传 的提取
+        for (const line of tcpOut.split(/\r?\n/)) {
           if (!line.trim()) continue;
-          const [streamStr, timeStr, method, uri, respCode, contentLength, srcIp] = line.split('\t');
+          const [streamStr, flagsHex, srcIp, timeStr,
+                 method, uri, respCode, contentLength, retrans] = line.split('\t');
           const streamIdx = parseInt(streamStr);
-          if (isNaN(streamIdx) || !httpStreamData[streamIdx]) continue;
-          const hd = httpStreamData[streamIdx];
-          hd.srcIps.add(srcIp);
-          const entry = { time: parseFloat(timeStr), srcIp };
+          if (isNaN(streamIdx) || !streamData[streamIdx]) continue;
+          const sd = streamData[streamIdx];
+          sd.srcIps.add(srcIp);
+
+          const entry = {
+            time: parseFloat(timeStr),
+            srcIp,
+            isRetransmission: !!retrans
+          };
+
+          // 从 tcp.flags hex 提取 FIN、RST 和 ACK（FIN=0x001, RST=0x004, ACK=0x010）
+          if (flagsHex) {
+            const hex = parseInt(flagsHex, 16);
+            if (!isNaN(hex)) {
+              if (hex & 0x001) {
+                sd.hasFin = true;
+                sd.finEvents.push({ time: entry.time, srcIp });
+              }
+              if (hex & 0x004) {
+                sd.rstEvents.push({ time: entry.time, srcIp });
+              }
+              if (hex & 0x010) {
+                entry.hasAck = true;
+              }
+            }
+          }
+
+          // 重传计数
+          if (retrans) sd.retransmissions++;
+
+          // HTTP 层分类
           if (method) {
             entry.type = 'request';
             entry.method = method;
             entry.uri = uri || '';
-            hd.totalHttpRequests++;
+            sd.totalHttpRequests++;
           } else if (respCode) {
             entry.type = 'response';
             entry.code = parseInt(respCode);
             entry.contentLength = contentLength ? parseInt(contentLength) : null;
-            hd.totalHttpResponses++;
-          } else {
-            continue; // 非 HTTP 请求/响应行，跳过
+            sd.totalHttpResponses++;
           }
-          hd.packets.push(entry);
+          // 非HTTP包不设 type，检测逻辑通过 p.type 过滤自然跳过
+
+          sd.packets.push(entry);
         }
 
-        // 按时间排序每个流的 HTTP 包序列
+        // 按时间排序每个流的包序列和FIN事件
         for (const idx of streamIndices) {
-          httpStreamData[idx].packets.sort((a, b) => a.time - b.time);
+          streamData[idx].packets.sort((a, b) => a.time - b.time);
+          streamData[idx].finEvents.sort((a, b) => a.time - b.time);
         }
 
-        // 解析 FIN 数据（含时间戳，用于时序分析）
-        for (const line of finRstOut.split('\n')) {
-          if (!line.trim()) continue;
-          const [streamStr, srcIp, timeStr] = line.split('\t');
-          const streamIdx = parseInt(streamStr);
-          if (isNaN(streamIdx) || !httpStreamData[streamIdx]) continue;
-          const hd = httpStreamData[streamIdx];
-          hd.hasFin = true;
-          hd.finEvents.push({ time: parseFloat(timeStr) || 0, srcIp });
+        // 解析 TLS 握手结果：标记哪些 TCP 流包含 TLS 握手
+        for (const idx of tlsStreamFiltered) {
+          if (streamData[idx]) {
+            streamData[idx].isTls = true;
+          }
         }
-        // 按 FIN 事件时间排序
+        console.error(`[analyze_l7_network] TLS握手流: ${tlsStreamFiltered.length}个 (命中过滤的: ${tlsStreamFiltered.length})`);
+
+        // 解析 TLS Application Data：按流分组存储加密应用数据事件
+        let tlsAppDataCount = 0;
+        for (const line of tlsAppDataOut.split(/\r?\n/)) {
+          if (!line.trim()) continue;
+          const [streamStr, timeStr, srcIp] = line.split('\t');
+          const streamIdx = parseInt(streamStr);
+          if (isNaN(streamIdx) || !streamData[streamIdx]) continue;
+          streamData[streamIdx].tlsAppDataEvents.push({
+            time: parseFloat(timeStr),
+            srcIp
+          });
+          tlsAppDataCount++;
+        }
+        // 对 TLS App Data 事件也按时间排序
         for (const idx of streamIndices) {
-          httpStreamData[idx].finEvents.sort((a, b) => a.time - b.time);
+          streamData[idx].tlsAppDataEvents.sort((a, b) => a.time - b.time);
         }
-
-        // 解析重传标记
-        for (const line of retransOut.split('\n')) {
-          if (!line.trim()) continue;
-          const [streamStr] = line.split('\t');
-          const streamIdx = parseInt(streamStr);
-          if (isNaN(streamIdx) || !httpStreamData[streamIdx]) continue;
-          httpStreamData[streamIdx].retransmissions++;
-        }
+        console.error(`[analyze_l7_network] TLS Application Data包: ${tlsAppDataCount}个`);
 
         // DNS 事务数据
         const dnsTransData = {};
@@ -1513,7 +1638,7 @@ server.tool(
           };
         }
 
-        for (const line of dnsOut.split('\n')) {
+        for (const line of dnsOut.split(/\r?\n/)) {
           if (!line.trim()) continue;
           const [idStr, timeStr, qryName, rcode, isResponse, dnsTime] = line.split('\t');
           const dnsId = parseInt(idStr);
@@ -1536,10 +1661,15 @@ server.tool(
 
         // HTTP 流检测
         for (const idx of streamIndices) {
-          const hd = httpStreamData[idx];
-          if (hd.packets.length === 0) continue; // 该流无 HTTP 数据，跳过
+          const hd = streamData[idx];
+          if (hd.totalHttpRequests === 0 && hd.totalHttpResponses === 0) continue; // 该流无 HTTP 数据，跳过
           const streamIssues = [];
-          const isUnidirectional = hd.srcIps.size === 1;
+          // 综合HTTP层数据和FIN事件判断是否单向流量
+          // 仅用HTTP包的srcIps会有缺陷：当服务端无HTTP响应时，srcIps只有客户端IP，被误判为单向
+          // 补充FIN事件的IP：如果FIN来自不同IP，说明是双向TCP流
+          const allKnownIps = new Set(hd.srcIps);
+          for (const fe of hd.finEvents) allKnownIps.add(fe.srcIp);
+          const isUnidirectional = allKnownIps.size === 1;
 
           // 1. HTTP 4xx 错误
           const codes4xx = hd.packets.filter(p => p.type === 'response' && p.code >= 400 && p.code < 500);
@@ -1627,52 +1757,144 @@ server.tool(
             });
           }
 
-          // 6. 服务端提前 FIN：基于时序判断服务端是否在请求未完成时关闭连接
-          if (hd.hasFin && !isUnidirectional) {
-            // 识别服务端 IP：流中只发送 HTTP 响应的 IP 视为服务端
+          // 6. HTTP请求无响应检测：统一检测请求发出后未收到响应的情况
+          //    根据是否存在服务端FIN，区分为两种子类型：
+          //    - SERVER_PREMATURE_FIN：服务端在请求未完成时发FIN关闭连接
+          //    - HTTP_REQUEST_NO_RESPONSE：请求无响应且无服务端FIN（如NAT超时、服务端崩溃等）
+          if (!isUnidirectional) {
+            // 识别服务端 IP：
+            // 优先：流中发送 HTTP 响应的 IP 视为服务端
+            // 退化：若无 HTTP 响应（如服务端直接FIN无响应），则FIN来源中非客户端请求IP的视为服务端
+            const requestSrcIps = new Set(
+              hd.packets.filter(p => p.type === 'request').map(p => p.srcIp)
+            );
             const responseSrcIps = new Set(
               hd.packets.filter(p => p.type === 'response').map(p => p.srcIp)
             );
+            // 如果有HTTP响应，响应方就是服务端；否则FIN来源中非请求方的IP视为服务端
+            let serverIps = responseSrcIps;
+            if (serverIps.size === 0 && hd.hasFin) {
+              serverIps = new Set(
+                hd.finEvents.filter(e => !requestSrcIps.has(e.srcIp)).map(e => e.srcIp)
+              );
+            }
             // 找出服务端发出的 FIN 事件
-            const serverFinEvents = hd.finEvents.filter(e => responseSrcIps.has(e.srcIp));
-            if (serverFinEvents.length > 0) {
-              // 取第一个服务端 FIN 时间点
-              const firstFinTime = serverFinEvents[0].time;
+            const serverFinEvents = hd.hasFin
+              ? hd.finEvents.filter(e => serverIps.has(e.srcIp))
+              : [];
+            const firstFinTime = serverFinEvents.length > 0 ? serverFinEvents[0].time : null;
 
-              // 基于时序判断：在 FIN 之前发出的请求，如果在 FIN 之后仍未收到响应 → 被中断
-              const affectedRequests = [];
-              for (let i = 0; i < hd.packets.length; i++) {
-                const pkt = hd.packets[i];
-                if (pkt.type !== 'request' || pkt.time >= firstFinTime) continue;
-                // 向后查找该请求是否在 FIN 之前收到了响应
-                let hasResponseBeforeFin = false;
-                for (let j = i + 1; j < hd.packets.length; j++) {
-                  const next = hd.packets[j];
-                  if (next.type === 'response' && next.time < firstFinTime) {
-                    hasResponseBeforeFin = true;
-                    break;
-                  }
-                  if (next.time >= firstFinTime) break;
+            // 使用FIFO队列进行请求-响应配对
+            // HTTP在同一TCP流中严格按序响应，因此第一个响应匹配最早未匹配的请求
+            const pendingRequests = [];  // 未匹配的请求队列
+            const prematureFinRequests = [];  // 有FIN：服务端未响应完毕就发FIN
+            const noResponseRequests = [];    // 无FIN：请求无响应
+
+            for (const pkt of hd.packets) {
+              // 服务端FIN之后的请求，直接归入无响应
+              // 注意：用 > 而非 >=，因为FIN包本身可能携带最后一个HTTP响应（常见于HTTP/1.1 Connection: close）
+              if (firstFinTime !== null && pkt.time > firstFinTime) {
+                if (pkt.type === 'request') {
+                  noResponseRequests.push({ method: pkt.method, uri: pkt.uri, requestTime: pkt.time.toFixed(3) });
                 }
-                if (!hasResponseBeforeFin) {
-                  affectedRequests.push({ method: pkt.method, uri: pkt.uri, requestTime: pkt.time.toFixed(3) });
-                }
+                continue;
               }
 
-              if (affectedRequests.length > 0) {
-                const severity = 'high';
-                streamIssues.push({
-                  type: 'SERVER_PREMATURE_FIN',
-                  severity,
-                  description: `服务端(${[...responseSrcIps].join(',')})在 ${firstFinTime.toFixed(3)}s 发送FIN，有 ${affectedRequests.length} 个已发出请求未在FIN前收到响应，连接被提前关闭`,
-                  detail: {
-                    serverIp: [...responseSrcIps],
-                    finTime: firstFinTime.toFixed(3),
-                    affectedRequestCount: affectedRequests.length,
-                    affectedRequests: affectedRequests.slice(0, 10)
-                  }
-                });
+              if (pkt.type === 'request') {
+                pendingRequests.push({ method: pkt.method, uri: pkt.uri, requestTime: pkt.time.toFixed(3) });
+              } else if (pkt.type === 'response') {
+                // FIFO：响应对应最早未匹配的请求
+                if (pendingRequests.length > 0) {
+                  pendingRequests.shift();
+                }
               }
+            }
+
+            // FIN前仍未匹配的请求：服务端未响应完毕就发FIN
+            if (firstFinTime !== null) {
+              prematureFinRequests.push(...pendingRequests);
+            } else {
+              // 无FIN时：未匹配的请求归入无响应
+              noResponseRequests.push(...pendingRequests);
+            }
+
+            // 过滤 TLS 流中的误报：同时满足以下三个条件才不计入提前FIN告警
+            // 条件1: 请求基于 TLS 的 HTTP 请求
+            // 条件2: 未看到对应的 HTTP 响应（已在 pendingRequests 中）
+            // 条件3: 客户端发 HTTP 请求后，服务端回完 ACK，紧跟着回 TLS Application Data
+            // 这种情况说明服务端确实响应了，只是响应为密文未能解密，不应报提前FIN
+            const tlsUndecryptedRequests = [];
+            if (hd.isTls && firstFinTime !== null && prematureFinRequests.length > 0) {
+              prematureFinRequests = prematureFinRequests.filter(req => {
+                const reqTime = parseFloat(req.requestTime);
+                // 检查服务端是否在请求后、FIN前发送了 TLS Application Data
+                const serverAppDataAfterReq = hd.tlsAppDataEvents.filter(e =>
+                  serverIps.has(e.srcIp) && e.time > reqTime && e.time < firstFinTime
+                );
+                if (serverAppDataAfterReq.length === 0) {
+                  return true; // 无加密数据，保持为提前FIN
+                }
+                // 进一步检查：请求后服务端是否回了 ACK（纯TCP ACK包，非HTTP数据）
+                const serverAckAfterReq = hd.packets.some(p =>
+                  serverIps.has(p.srcIp) &&
+                  p.hasAck &&
+                  !p.type &&
+                  p.time > reqTime &&
+                  p.time < serverAppDataAfterReq[0].time
+                );
+                if (serverAckAfterReq) {
+                  // 三个条件都满足：响应可能为密文未解密，不计入提前FIN
+                  tlsUndecryptedRequests.push(req);
+                  return false;
+                }
+                return true; // 无ACK确认，仍保留在提前FIN
+              });
+            }
+
+            // 报告服务端提前FIN
+            if (prematureFinRequests.length > 0) {
+              streamIssues.push({
+                type: 'SERVER_PREMATURE_FIN',
+                severity: 'high',
+                description: `服务端(${[...serverIps].join(',')})在 ${firstFinTime.toFixed(3)}s 发送FIN，有 ${prematureFinRequests.length} 个已发出请求未在FIN前收到响应，连接被提前关闭`,
+                detail: {
+                  serverIp: [...serverIps],
+                  finTime: firstFinTime.toFixed(3),
+                  affectedRequestCount: prematureFinRequests.length,
+                  affectedRequests: prematureFinRequests.slice(0, 10)
+                }
+              });
+            }
+
+            // 报告 TLS 响应疑似未解密（不计入提前FIN，但提醒用户可能存在解密失败）
+            if (tlsUndecryptedRequests.length > 0) {
+              streamIssues.push({
+                type: 'TLS_DECRYPT_PARTIAL',
+                severity: 'medium',
+                description: `检测到 ${tlsUndecryptedRequests.length} 个基于TLS的HTTP请求，服务端在ACK后回复了TLS Application Data（加密响应数据），但未解密出HTTP响应。可能原因：响应数据过大、TCP乱序/重传导致解密失败等。建议重新抓包或使用高版本tshark/wireshark重试解密。`,
+                detail: {
+                  serverIp: [...serverIps],
+                  finTime: firstFinTime.toFixed(3),
+                  affectedRequestCount: tlsUndecryptedRequests.length,
+                  affectedRequests: tlsUndecryptedRequests.slice(0, 10)
+                }
+              });
+            }
+
+            // 报告请求无响应（无服务端FIN）
+            // 注意：如果服务端发了RST，L4分析工具已覆盖此场景，L7不再重复告警
+            const hasServerRst = serverIps.size > 0 &&
+              hd.rstEvents.some(e => serverIps.has(e.srcIp));
+            if (noResponseRequests.length > 0 && !hasServerRst) {
+              streamIssues.push({
+                type: 'HTTP_REQUEST_NO_RESPONSE',
+                severity: 'medium',
+                description: `检测到 ${noResponseRequests.length} 个HTTP请求未收到响应且无服务端FIN，可能原因：服务端崩溃、NAT超时、中间设备丢包等`,
+                detail: {
+                  affectedRequestCount: noResponseRequests.length,
+                  affectedRequests: noResponseRequests.slice(0, 10)
+                }
+              });
             }
           }
 
@@ -1771,6 +1993,507 @@ server.tool(
         };
       } catch (error) {
         console.error(`[analyze_l7_network] 执行错误: ${error.message}`);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: error.message }, null, 2) }],
+          isError: true
+        };
+      }
+    }
+  );
+
+  // Tool 11: SSL/TLS 解密分析
+  server.tool(
+    'analyze_ssl_tls',
+    '解密分析SSL/TLS流量：分析TLS握手安全信息（弱版本、弱密码等），并使用SSLKEYLOGFILE解密流量，分析获取HTTP明文内容（请求行为、响应摘要），检测4xx/5xx、重定向循环、响应过慢等HTTP问题。返回JSON格式报告。',
+    {
+      pcapPath: z.string().describe('待分析的PCAP文件路径，例如：./demo.pcap'),
+      sslKeylogPath: z.string().describe('SSLKEYLOGFILE文件路径（NSS Key Log格式），例如：./sslkeylog.txt'),
+    },
+    async (args) => {
+      try {
+        const tsharkPath = await findTshark();
+        const { pcapPath, sslKeylogPath: sslKeylogArg } = args;
+        console.error(`[analyze_ssl_tls] 开始分析: pcapPath=${pcapPath}, sslKeylogPath=${sslKeylogArg}`);
+
+        const safePcapPath = await validatePcapPath(pcapPath);
+        const safeKeylogPath = await validateKeylogPath(sslKeylogArg);
+
+        // ── Step 0: 配置 tshark 环境变量 ──
+        const tsharkEnv = {
+          ...process.env,
+          PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin`
+        };
+        const execOpts = { maxBuffer: 10 * 1024 * 1024, env: tsharkEnv };
+
+        // ── Step 1: TLS 握手阶段安全分析（不使用密钥） ──
+        console.error(`[analyze_ssl_tls] Step1 TLS握手分析（不使用密钥）`);
+        const { stdout: handshakeOut } = await execFileAsync(tsharkPath, [
+          '-r', safePcapPath, '-T', 'fields',
+          '-e', 'tcp.stream',
+          '-e', 'tls.handshake.type',
+          '-e', 'tls.handshake.version',
+          '-e', 'tls.handshake.extensions_server_name',
+          '-e', 'tls.handshake.ciphersuite',
+          '-e', 'ip.src', '-e', 'ip.dst',
+          '-e', 'frame.time_epoch',
+          '-Y', 'tls.handshake'
+        ], execOpts);
+
+        // ── 密码套件名称映射表（常用） ──
+        const CIPHER_NAMES = {
+          0x0000: 'TLS_NULL_WITH_NULL_NULL',
+          0x0001: 'TLS_RSA_WITH_NULL_MD5',
+          0x0002: 'TLS_RSA_WITH_NULL_SHA',
+          0x0004: 'TLS_RSA_WITH_RC4_128_MD5',
+          0x0005: 'TLS_RSA_WITH_RC4_128_SHA',
+          0x0009: 'TLS_RSA_WITH_DES_CBC_SHA',
+          0x000A: 'TLS_RSA_WITH_3DES_EDE_CBC_SHA',
+          0x0016: 'TLS_DHE_DSS_WITH_3DES_EDE_CBC_SHA',
+          0x0017: 'TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA',
+          0x002F: 'TLS_RSA_WITH_AES_128_CBC_SHA',
+          0x0033: 'TLS_DHE_RSA_WITH_AES_128_CBC_SHA',
+          0x0035: 'TLS_RSA_WITH_AES_256_CBC_SHA',
+          0x003C: 'TLS_RSA_WITH_AES_128_CBC_SHA256',
+          0x003D: 'TLS_RSA_WITH_AES_256_CBC_SHA256',
+          0x0062: 'TLS_RSA_EXPORT1024_WITH_DES_CBC_SHA',
+          0x0063: 'TLS_DHE_DSS_EXPORT1024_WITH_DES_CBC_SHA',
+          0x006B: 'TLS_DHE_RSA_WITH_AES_256_CBC_SHA256',
+          0x009C: 'TLS_RSA_WITH_AES_128_GCM_SHA256',
+          0x009D: 'TLS_RSA_WITH_AES_256_GCM_SHA384',
+          0xC007: 'TLS_ECDHE_ECDSA_WITH_RC4_128_SHA',
+          0xC011: 'TLS_ECDHE_RSA_WITH_RC4_128_SHA',
+          0xC012: 'TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA',
+          0xC023: 'TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256',
+          0xC027: 'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256',
+          0xC02B: 'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256',
+          0xC02F: 'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256',
+          0xC030: 'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384',
+          0xCCA8: 'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256',
+          0xCCA9: 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256',
+          0x1301: 'TLS_AES_128_GCM_SHA256',
+          0x1302: 'TLS_AES_256_GCM_SHA384',
+          0x1303: 'TLS_CHACHA20_POLY1305_SHA256'
+        };
+
+        const WEAK_PATTERNS = /NULL|RC4|DES(?!_POLY)|_anon_|EXPORT|EXP1024|WITH_NULL|3DES/;
+
+        function getCipherName(hex) {
+          if (hex === '' || hex === undefined || hex === null) return 'unknown';
+          const num = parseInt(hex, 16);
+          if (CIPHER_NAMES[num]) return CIPHER_NAMES[num];
+          return `0x${num.toString(16).toUpperCase().padStart(4, '0')}`;
+        }
+
+        function isWeakCipher(hex) {
+          if (hex === '' || hex === undefined || hex === null) return false;
+          const name = getCipherName(hex);
+          return WEAK_PATTERNS.test(name);
+        }
+
+        // 解析握手数据，按 TCP 流分组
+        const handshakeData = {};
+        for (const line of handshakeOut.split(/\r?\n/)) {
+          if (!line.trim()) continue;
+          const [streamStr, typeStr, version, sni, ciphersuite, srcIp, dstIp, timeStr] = line.split('\t');
+          const streamIdx = parseInt(streamStr);
+          if (isNaN(streamIdx)) continue;
+          if (!handshakeData[streamIdx]) {
+            handshakeData[streamIdx] = {
+              streamIndex: streamIdx,
+              serverNames: new Set(),
+              clientVersions: new Set(),
+              cipherSuites: new Set(),
+              handshakeTypes: new Set(),
+              srcIps: new Set(),
+              dstIps: new Set(),
+              firstTime: null,
+              lastTime: null
+            };
+          }
+          const hd = handshakeData[streamIdx];
+          const t = parseFloat(timeStr);
+          if (t && (hd.firstTime === null || t < hd.firstTime)) hd.firstTime = t;
+          if (t && (hd.lastTime === null || t > hd.lastTime)) hd.lastTime = t;
+          if (typeStr) hd.handshakeTypes.add(parseInt(typeStr));
+          if (version) hd.clientVersions.add(version);
+          if (sni) hd.serverNames.add(sni);
+          if (ciphersuite) hd.cipherSuites.add(ciphersuite);
+          if (srcIp) hd.srcIps.add(srcIp);
+          if (dstIp) hd.dstIps.add(dstIp);
+        }
+
+        const tlsStreamIndices = Object.keys(handshakeData).map(Number).sort((a, b) => a - b);
+
+        if (tlsStreamIndices.length === 0) {
+          // 无 TLS 握手数据，检查是否有其它加密流量
+          const { stdout: tlsCheck } = await execFileAsync(tsharkPath, [
+            '-r', safePcapPath, '-T', 'fields', '-e', 'tcp.port',
+            '-Y', 'tcp.port == 443', '-c', '5'
+          ], execOpts);
+          if (!tlsCheck.trim()) {
+            const noTlsResult = {
+              pcapPath,
+              sslKeylogPath: sslKeylogArg,
+              tlsHandshake: null,
+              decryptedTraffic: null,
+              httpIssues: [],
+              summary: '未在PCAP中发现TLS握手流量，无法进行SSL/TLS分析。'
+            };
+            return { content: [{ type: 'text', text: JSON.stringify(noTlsResult, null, 2) }] };
+          }
+        }
+
+        // TLS握手安全检测
+        const handshakes = [];
+        for (const idx of tlsStreamIndices) {
+          const hd = handshakeData[idx];
+          const hIssues = [];
+
+          // 检测弱版本
+          for (const ver of hd.clientVersions) {
+            const verNum = parseInt(ver, 16);
+            if (verNum <= 0x0301) {
+              hIssues.push({
+                type: 'TLS_WEAK_VERSION',
+                severity: 'critical',
+                description: `检测到TLS版本 ${ver} (TLS 1.0 或更低)，存在已知安全漏洞（BEAST、POODLE）`,
+                detail: { version: ver }
+              });
+            } else if (verNum === 0x0302) {
+              hIssues.push({
+                type: 'TLS_WEAK_VERSION',
+                severity: 'high',
+                description: `检测到TLS版本 ${ver} (TLS 1.1)，属于已弃用的不安全版本`,
+                detail: { version: ver }
+              });
+            } else if (verNum === 0x0303) {
+              hIssues.push({
+                type: 'TLS_WEAK_VERSION',
+                severity: 'low',
+                description: `检测到TLS版本 ${ver} (TLS 1.2)，建议升级到TLS 1.3以提升安全性`,
+                detail: { version: ver }
+              });
+            }
+          }
+
+          // 检测弱密码套件
+          const weakCiphers = [...hd.cipherSuites].filter(c => isWeakCipher(c));
+          if (weakCiphers.length > 0) {
+            hIssues.push({
+              type: 'TLS_WEAK_CIPHER',
+              severity: 'high',
+              description: `检测到 ${weakCiphers.length} 个弱密码套件: ${weakCiphers.map(c => getCipherName(c)).join(', ')}`,
+              detail: {
+                count: weakCiphers.length,
+                ciphers: weakCiphers.map(c => ({ code: `0x${parseInt(c, 16).toString(16).toUpperCase()}`, name: getCipherName(c) }))
+              }
+            });
+          }
+
+          // 检测缺少SNI
+          if (hd.serverNames.size === 0) {
+            hIssues.push({
+              type: 'TLS_NO_SNI',
+              severity: 'low',
+              description: 'Client Hello缺少SNI (Server Name Indication) 扩展',
+              detail: {}
+            });
+          }
+
+          // 检测握手失败：有Client Hello但没有Server Hello
+          const hasClientHello = hd.handshakeTypes.has(1);
+          const hasServerHello = hd.handshakeTypes.has(2);
+          if (hasClientHello && !hasServerHello) {
+            hIssues.push({
+              type: 'TLS_HANDSHAKE_FAILURE',
+              severity: 'high',
+              description: '检测到Client Hello但无Server Hello响应，TLS握手可能失败',
+              detail: { handshakeTypes: [...hd.handshakeTypes] }
+            });
+          }
+
+          handshakes.push({
+            streamIndex: idx,
+            serverNames: [...hd.serverNames],
+            clientVersions: [...hd.clientVersions],
+            cipherSuites: [...hd.cipherSuites].map(c => getCipherName(c)),
+            srcIps: [...hd.srcIps],
+            dstIps: [...hd.dstIps],
+            handshakeTypes: [...hd.handshakeTypes],
+            issues: hIssues
+          });
+        }
+
+        const totalHandshakeIssues = handshakes.reduce((s, h) => s + h.issues.length, 0);
+        const tlsSummary = tlsStreamIndices.length === 0
+          ? '未发现TLS握手流量。'
+          : `发现 ${tlsStreamIndices.length} 个TLS流，${handshakes.filter(h => h.issues.length > 0).length} 个流存在安全问题，共 ${totalHandshakeIssues} 个问题。`;
+
+        console.error(`[analyze_ssl_tls] Step1 完成: ${tlsStreamIndices.length} 个TLS流，${totalHandshakeIssues} 个问题`);
+
+        // ── Step 2: 使用 SSLKEYLOGFILE 解密流量 ──
+        console.error(`[analyze_ssl_tls] Step2 使用SSLKEYLOGFILE解密`);
+        const { stdout: decryptedOut } = await execFileAsync(tsharkPath, [
+          '-o', `tls.keylog_file:${safeKeylogPath}`,
+          '-r', safePcapPath, '-T', 'fields',
+          '-e', 'tcp.stream',
+          '-e', 'ip.src', '-e', 'ip.dst',
+          '-e', 'frame.time_epoch',
+          '-e', 'http.request.method', '-e', 'http.request.uri',
+          '-e', 'http.host', '-e', 'http.user_agent',
+          '-e', 'http.response.code', '-e', 'http.content_length',
+          '-e', 'http.content_type', '-e', 'http.location',
+          '-e', 'http.file_data',
+          '-Y', 'http'
+        ], { maxBuffer: 50 * 1024 * 1024, env: tsharkEnv });
+
+        // ── Step 3: 解析解密数据 + 总体行为分析 ──
+        const streamHttpData = {};
+        let totalRequests = 0, totalResponses = 0;
+        const hostCounts = {}, methodCounts = {}, userAgentSet = new Set();
+        const contentTypeCounts = {};
+        const uriRequests = {};  // key: "METHOD uri", value: { count, responses: [{code, bodySummary}] }
+
+        for (const line of decryptedOut.split(/\r?\n/)) {
+          if (!line.trim()) continue;
+          const parts = line.split('\t');
+          const streamIdx = parseInt(parts[0]);
+          if (isNaN(streamIdx)) continue;
+          const srcIp = parts[1], dstIp = parts[2], timeStr = parts[3];
+          const method = parts[4], uri = parts[5], host = parts[6], userAgent = parts[7];
+          const respCodeStr = parts[8], contentLength = parts[9];
+          const contentType = parts[10], location = parts[11];
+          const fileDataHex = parts[12];
+
+          if (!streamHttpData[streamIdx]) {
+            streamHttpData[streamIdx] = { streamIndex: streamIdx, packets: [], srcIps: new Set() };
+          }
+          const sd = streamHttpData[streamIdx];
+          sd.srcIps.add(srcIp);
+
+          const entry = { time: parseFloat(timeStr), srcIp, dstIp };
+
+          if (method) {
+            entry.type = 'request';
+            entry.method = method;
+            entry.uri = uri || '';
+            if (host) entry.host = host;
+            if (userAgent) entry.userAgent = userAgent;
+            totalRequests++;
+            if (host) hostCounts[host] = (hostCounts[host] || 0) + 1;
+            methodCounts[method] = (methodCounts[method] || 0) + 1;
+            if (userAgent) userAgentSet.add(userAgent);
+
+            // URI聚合：用method+uri做key
+            const uriKey = `${method} ${uri}`;
+            if (!uriRequests[uriKey]) uriRequests[uriKey] = { method, uri, count: 0, responses: [] };
+            uriRequests[uriKey].count++;
+          } else if (respCodeStr) {
+            entry.type = 'response';
+            entry.code = parseInt(respCodeStr);
+            if (contentLength) entry.contentLength = parseInt(contentLength);
+            if (contentType) entry.contentType = contentType;
+            entry.location = location || null;
+            totalResponses++;
+            if (contentType) contentTypeCounts[contentType] = (contentTypeCounts[contentType] || 0) + 1;
+
+            // 收集响应摘要：关联最近的请求URI
+            if (fileDataHex && fileDataHex.length >= 8) {
+              try {
+                const decoded = decodeHexFields(fileDataHex);
+                // decodeHexFields 可能返回带 [binary data] 标记的原始 hex
+                if (decoded && !decoded.includes('[binary data]')) {
+                  entry.bodySummary = decoded.substring(0, 200);
+                }
+              } catch { /* ignore decode errors */ }
+            }
+
+            // 将响应关联到最近的请求
+            const recentUris = Object.keys(uriRequests);
+            if (recentUris.length > 0) {
+              const lastKey = recentUris[recentUris.length - 1];
+              uriRequests[lastKey].responses.push({
+                code: entry.code,
+                contentType: contentType || '',
+                bodySummary: entry.bodySummary || ''
+              });
+            }
+          }
+          sd.packets.push(entry);
+        }
+
+        // 排序每个流的包
+        for (const idx of Object.keys(streamHttpData)) {
+          streamHttpData[idx].packets.sort((a, b) => a.time - b.time);
+        }
+        const httpStreamIndices = Object.keys(streamHttpData).map(Number).sort((a, b) => a - b);
+
+        // 解密校验
+        const decryptionVerified = totalRequests > 0;
+        let decryptionWarning = null;
+        if (!decryptionVerified && tlsStreamIndices.length > 0) {
+          decryptionWarning = 'DECRYPTION_MAYBE_FAILED: 存在TLS握手流量但解密后HTTP请求数为0，请检查SSLKEYLOGFILE是否与PCAP匹配';
+        }
+
+        // 构建 topUris（按频次降序，取前30）
+        const topUris = Object.values(uriRequests)
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 30)
+          .map(u => ({
+            method: u.method,
+            uri: u.uri,
+            count: u.count,
+            responseCode: u.responses.length > 0 ? u.responses[0].code : null,
+            responseSummary: u.responses.length > 0 ? (u.responses[0].bodySummary || '').substring(0, 200) : ''
+          }));
+
+        console.error(`[analyze_ssl_tls] Step3 完成: ${totalRequests} 个HTTP请求, ${totalResponses} 个响应, ${httpStreamIndices.length} 个流`);
+
+        // ── Step 4: HTTP 问题检测 ──
+        const httpIssues = [];
+        for (const idx of httpStreamIndices) {
+          const sd = streamHttpData[idx];
+          const streamIssues = [];
+
+          // 1. HTTP 4xx 错误
+          const codes4xx = sd.packets.filter(p => p.type === 'response' && p.code >= 400 && p.code < 500);
+          if (codes4xx.length > 0) {
+            streamIssues.push({
+              type: 'HTTP_4XX_ERROR',
+              severity: 'medium',
+              description: `检测到 ${codes4xx.length} 个HTTP 4xx客户端错误响应`,
+              detail: { count: codes4xx.length, codes: [...new Set(codes4xx.map(p => p.code))] }
+            });
+          }
+
+          // 2. HTTP 5xx 错误
+          const codes5xx = sd.packets.filter(p => p.type === 'response' && p.code >= 500 && p.code < 600);
+          if (codes5xx.length > 0) {
+            streamIssues.push({
+              type: 'HTTP_5XX_ERROR',
+              severity: 'high',
+              description: `检测到 ${codes5xx.length} 个HTTP 5xx服务器错误响应`,
+              detail: { count: codes5xx.length, codes: [...new Set(codes5xx.map(p => p.code))] }
+            });
+          }
+
+          // 3. HTTP 重定向循环：同一流内连续出现 >=3 次 3xx 响应
+          const respSequence = sd.packets.filter(p => p.type === 'response').map(p => p.code);
+          let maxConsecutive = 0, cur = 0;
+          for (const code of respSequence) {
+            if (code >= 300 && code < 400) { cur++; if (cur > maxConsecutive) maxConsecutive = cur; }
+            else cur = 0;
+          }
+          if (maxConsecutive >= 3) {
+            streamIssues.push({
+              type: 'HTTP_REDIRECT_LOOP',
+              severity: 'high',
+              description: `同一流内连续出现 ${maxConsecutive} 次3xx重定向响应，疑似重定向循环`,
+              detail: { consecutiveRedirects: maxConsecutive }
+            });
+          }
+
+          // 4. HTTP 响应极慢：请求到响应时间差 > 30s
+          const slowPairs = [];
+          let maxSlow = 0;
+          for (let i = 0; i < sd.packets.length; i++) {
+            if (sd.packets[i].type !== 'request') continue;
+            const reqTime = sd.packets[i].time;
+            for (let j = i + 1; j < sd.packets.length; j++) {
+              if (sd.packets[j].type === 'response') {
+                const elapsed = sd.packets[j].time - reqTime;
+                if (elapsed > 30) {
+                  slowPairs.push({ uri: sd.packets[i].uri, elapsed: elapsed.toFixed(2) });
+                  if (elapsed > maxSlow) maxSlow = elapsed;
+                }
+                break;
+              }
+            }
+          }
+          if (slowPairs.length > 0) {
+            streamIssues.push({
+              type: 'HTTP_SLOW_RESPONSE',
+              severity: 'medium',
+              description: `检测到 ${slowPairs.length} 个HTTP响应耗时超过30秒(最长${maxSlow.toFixed(2)}秒)`,
+              detail: { count: slowPairs.length, maxElapsed: maxSlow.toFixed(2), samples: slowPairs.slice(0, 5) }
+            });
+          }
+
+          if (streamIssues.length > 0) {
+            httpIssues.push({
+              streamIndex: idx,
+              protocol: 'HTTP',
+              packetCount: sd.packets.length,
+              detectedIssues: streamIssues
+            });
+          }
+        }
+
+        console.error(`[analyze_ssl_tls] Step4 完成: ${httpIssues.length} 个流存在HTTP问题`);
+
+        // ── Step 5: 构建 JSON 输出 ──
+        const hostsSorted = Object.entries(hostCounts)
+          .sort((a, b) => b[1] - a[1])
+          .map(([host, count]) => ({ host, count }));
+
+        const result = {
+          pcapPath,
+          sslKeylogPath: sslKeylogArg,
+          tlsHandshake: {
+            totalTlsStreams: tlsStreamIndices.length,
+            handshakes,
+            summary: tlsSummary
+          },
+          decryptedTraffic: {
+            decryptionVerified,
+            decryptionWarning,
+            totalStreams: httpStreamIndices.length,
+            totalHttpRequests: totalRequests,
+            totalHttpResponses: totalResponses,
+            hosts: hostsSorted,
+            methods: methodCounts,
+            userAgents: [...userAgentSet],
+            contentTypes: contentTypeCounts,
+            topUris
+          },
+          httpIssues,
+          summary: httpIssues.length === 0
+            ? (decryptionVerified
+              ? `解密了 ${httpStreamIndices.length} 个TCP流中的 ${totalRequests} 个HTTP请求/${totalResponses} 个响应，未发现HTTP问题。`
+              : `TLS握手分析完成（${tlsStreamIndices.length} 个流），但HTTP解密未发现明文流量。`)
+            : `解密了 ${httpStreamIndices.length} 个TCP流中的 ${totalRequests} 个HTTP请求/${totalResponses} 个响应，发现 ${httpIssues.length} 个流存在问题，共 ${httpIssues.reduce((s, i) => s + i.detectedIssues.length, 0)} 个HTTP问题。`
+        };
+
+        // 输出截断保护（复用L7模式: 200KB上限，按比例裁剪issues数组）
+        let jsonOutput = JSON.stringify(result, null, 2);
+        const maxChars = 200000;
+        if (jsonOutput.length > maxChars) {
+          const trimFactor = maxChars / jsonOutput.length;
+          const truncatedResult = { ...result };
+          // 裁剪 httpIssues（HTTP问题检测结果）
+          truncatedResult.httpIssues = result.httpIssues.slice(0, Math.floor(result.httpIssues.length * trimFactor));
+          // 裁剪 handshakes（如果仍有必要）
+          if (JSON.stringify(truncatedResult).length > maxChars) {
+            truncatedResult.tlsHandshake = {
+              ...result.tlsHandshake,
+              handshakes: result.tlsHandshake.handshakes.slice(0, Math.floor(result.tlsHandshake.handshakes.length * trimFactor))
+            };
+          }
+          // 裁剪 topUris
+          if (JSON.stringify(truncatedResult).length > maxChars) {
+            truncatedResult.decryptedTraffic = {
+              ...result.decryptedTraffic,
+              topUris: result.decryptedTraffic.topUris.slice(0, Math.floor(result.decryptedTraffic.topUris.length * trimFactor))
+            };
+          }
+          truncatedResult.summary += ' (输出已截断，部分详情被省略)';
+          jsonOutput = JSON.stringify(truncatedResult, null, 2);
+        }
+
+        console.error(`[analyze_ssl_tls] 分析完成: TLS流=${tlsStreamIndices.length}, HTTP流=${httpStreamIndices.length}, 问题流=${httpIssues.length}`);
+        return { content: [{ type: 'text', text: jsonOutput }] };
+      } catch (error) {
+        console.error(`[analyze_ssl_tls] 执行错误: ${error.message}`);
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: error.message }, null, 2) }],
           isError: true
@@ -1977,7 +2700,7 @@ async function main() {
   const args = process.argv.slice(2);
   const isHttp = args.includes('--http');
   const portIndex = args.indexOf('--port');
-  const port = portIndex !== -1 ? parseInt(args[portIndex + 1]) : 3000;
+  const port = portIndex !== -1 ? parseInt(args[portIndex + 1]) : 10001;
 
   if (isHttp) {
     // HTTP mode: Streamable HTTP Transport

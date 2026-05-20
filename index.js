@@ -2703,74 +2703,33 @@ async function main() {
   const port = portIndex !== -1 ? parseInt(args[portIndex + 1]) : 10001;
 
   if (isHttp) {
-    // HTTP mode: Streamable HTTP Transport (multi-session)
-    // Each client gets its own McpServer + Transport instance, keyed by sessionId.
-    // This allows multiple concurrent clients and proper session reconnection.
-    const transports = new Map(); // sessionId -> StreamableHTTPServerTransport
+    // HTTP mode: Streamable HTTP Transport (stateless mode)
+    // Each request gets a fresh McpServer + Transport, no Session-ID required
+    const getServer = () => {
+      const server = new McpServer({
+        name: 'wiremcp',
+        version: '1.0.0',
+      });
+      registerTools(server);
+      registerPrompts(server);
+      return server;
+    };
 
     const app = express();
     app.use(express.json());
     app.all('/mcp', async (req, res) => {
+      const server = getServer();
       try {
-        const sessionId = req.headers['mcp-session-id'];
-
-        if (sessionId) {
-          // Existing session: route to the matching transport
-          const transport = transports.get(sessionId);
-          if (!transport) {
-            res.status(404).json({
-              jsonrpc: '2.0',
-              error: { code: -32001, message: 'Session not found' },
-              id: null,
-            });
-            return;
-          }
-          await transport.handleRequest(req, res, req.body);
-
-          // Clean up on DELETE (session termination)
-          if (req.method === 'DELETE') {
-            transports.delete(sessionId);
-            console.error(`Session deleted: ${sessionId} (remaining: ${transports.size})`);
-          }
-        } else if (req.method === 'POST') {
-          // No session ID: must be an initialize request for a new session
-          const body = req.body;
-          const isInit = body && body.method === 'initialize';
-          if (!isInit) {
-            res.status(400).json({
-              jsonrpc: '2.0',
-              error: { code: -32000, message: 'Bad Request: Mcp-Session-Id header is required' },
-              id: null,
-            });
-            return;
-          }
-
-          // Create a fresh McpServer + Transport for this new client
-          const server = new McpServer({
-            name: 'wiremcp',
-            version: '1.0.0',
-          });
-          registerTools(server);
-          registerPrompts(server);
-
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => crypto.randomUUID(),
-            onsessioninitialized: (sid) => {
-              transports.set(sid, transport);
-              console.error(`Session initialized: ${sid} (total: ${transports.size})`);
-            },
-          });
-
-          await server.connect(transport);
-          await transport.handleRequest(req, res, body);
-        } else {
-          // GET/DELETE without session ID
-          res.status(400).json({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'Bad Request: Mcp-Session-Id header is required' },
-            id: null,
-          });
-        }
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined, // Stateless: no session management
+        });
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+        // Cleanup when request closes
+        res.on('close', () => {
+          transport.close();
+          server.close();
+        });
       } catch (err) {
         console.error(`Error handling MCP request: ${err.message}`);
         if (!res.headersSent) {
@@ -2782,8 +2741,23 @@ async function main() {
         }
       }
     });
+    // Reject GET/DELETE (stateless mode doesn't support SSE streams)
+    app.get('/mcp', (req, res) => {
+      res.status(405).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Method not allowed' },
+        id: null,
+      });
+    });
+    app.delete('/mcp', (req, res) => {
+      res.status(405).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Method not allowed' },
+        id: null,
+      });
+    });
     app.listen(port, () => {
-      console.error(`WireMCP HTTP server listening on http://localhost:${port}/mcp`);
+      console.error(`WireMCP HTTP server listening on http://localhost:${port}/mcp (stateless mode)`);
     });
   } else {
     // STDIO mode (default, original behavior)

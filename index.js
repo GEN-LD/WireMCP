@@ -2701,10 +2701,13 @@ async function main() {
   const isHttp = args.includes('--http');
   const portIndex = args.indexOf('--port');
   const port = portIndex !== -1 ? parseInt(args[portIndex + 1]) : 10001;
+  const sseArg = args.find(a => a.startsWith('--sse='));
+  const isSse = sseArg ? sseArg.split('=')[1] === 'true' : false;
 
   if (isHttp) {
     // HTTP mode: Streamable HTTP Transport (stateless mode)
     // Each request gets a fresh McpServer + Transport, no Session-ID required
+    // SSE disabled by default (JSON response), use --sse=true to enable SSE streaming
     const getServer = () => {
       const server = new McpServer({
         name: 'wiremcp',
@@ -2722,6 +2725,7 @@ async function main() {
       try {
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined, // Stateless: no session management
+          enableJsonResponse: !isSse,
         });
         await server.connect(transport);
         await transport.handleRequest(req, res, req.body);
@@ -2741,7 +2745,7 @@ async function main() {
         }
       }
     });
-    // Reject GET/DELETE (stateless mode doesn't support SSE streams)
+    // Reject GET/DELETE (stateless mode)
     app.get('/mcp', (req, res) => {
       res.status(405).json({
         jsonrpc: '2.0',
@@ -2757,7 +2761,7 @@ async function main() {
       });
     });
     app.listen(port, () => {
-      console.error(`WireMCP HTTP server listening on http://localhost:${port}/mcp (stateless mode)`);
+      console.error(`WireMCP HTTP server listening on http://localhost:${port}/mcp (stateless mode, SSE=${isSse})`);
     });
   } else {
     // STDIO mode (default, original behavior)

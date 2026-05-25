@@ -87,18 +87,20 @@ WireMCP 使用**无状态模式**（stateless），每次请求独立处理：
 | `method` | 调用方法：`tools/list` 列出工具、`tools/call` 调用工具 |
 | `params` | 方法参数 |
 
-### 2.5 curl 调用模板
+### 2.5 HTTP 请求格式
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"<id>","method":"<method>","params":{<params>}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"<id>","method":"<method>","params":{<params>}}
 ```
 
 **注意事项**：
 - 文件路径使用**正斜杠** `/`（如 `D:/path/to/file.pcap`），避免反斜杠转义问题
-- `-s` 静默模式，不显示进度条
+- 请求体为原始 JSON，直接放置在请求头后的空行之后
 - 响应为 SSE 格式，数据在 `data:` 行中
 
 ---
@@ -117,11 +119,13 @@ Step 3: (可选) 重复 Step 2
 
 ### 3.2 Step 1 — 获取工具列表（可选）
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"list-1","method":"tools/list","params":{}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"list-1","method":"tools/list","params":{}}
 ```
 
 **响应示例**：
@@ -138,11 +142,13 @@ data: {"result":{"tools":[{"name":"capture_packets","description":"Capture live 
 
 ### 3.3 Step 2 — 调用工具（通用格式）
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"call-1","method":"tools/call","params":{"name":"<工具名>","arguments":{"<参数名>":"<参数值>"}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"call-1","method":"tools/call","params":{"name":"<工具名>","arguments":{"<参数名>":"<参数值>"}}}
 ```
 
 **成功响应**：
@@ -180,11 +186,13 @@ data: {"result":{"content":[{"type":"text","text":"Error: tshark not found"}],"i
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"cap-1","method":"tools/call","params":{"name":"capture_packets","arguments":{"interface":"eth0","duration":10}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"cap-1","method":"tools/call","params":{"name":"capture_packets","arguments":{"interface":"eth0","duration":10}}}
 ```
 
 **返回内容**：JSON 格式的数据包数组，包含帧号、源/目的 IP、源/目的端口、TCP 标志、时间戳、HTTP 方法/状态码等字段。输出超过 720KB 时自动截断。
@@ -207,11 +215,13 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"pcap-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"pcap-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}
 ```
 
 **返回内容**：唯一 IP 列表、URL 列表、协议列表、数据包 JSON 数据及截断信息。输出超过 200KB 时自动截断。
@@ -234,11 +244,13 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"stats-1","method":"tools/call","params":{"name":"get_summary_stats","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"stats-1","method":"tools/call","params":{"name":"get_summary_stats","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}
 ```
 
 **返回内容**：tshark 协议层次树，展示各协议层的数据包数、字节数、占比。
@@ -261,11 +273,13 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"conv-1","method":"tools/call","params":{"name":"get_conversations","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"conv-1","method":"tools/call","params":{"name":"get_conversations","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}
 ```
 
 **返回内容**：TCP 会话统计表，包含正向/反向字节数、帧数、持续时间。输出超过 100KB 时自动截断。
@@ -288,11 +302,13 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"cred-1","method":"tools/call","params":{"name":"extract_credentials","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"cred-1","method":"tools/call","params":{"name":"extract_credentials","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}
 ```
 
 **返回内容**：
@@ -318,11 +334,13 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"l4-1","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-Y \"ip.addr == 192.168.1.100\""}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"l4-1","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-Y \"ip.addr == 192.168.1.100\""}}}
 ```
 
 **返回内容**：JSON 格式报告，包含每个 TCP 流的问题列表、问题类型、详细描述。
@@ -346,11 +364,13 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"l7-1","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-Y \"http\""}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"l7-1","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-Y \"http\""}}}
 ```
 
 **返回内容**：JSON 格式报告，包含每个流/事务的应用层问题列表。
@@ -374,11 +394,13 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"tls-1","method":"tools/call","params":{"name":"analyze_ssl_tls","arguments":{"pcapPath":"D:/captures/demo.pcap","sslKeylogPath":"D:/captures/sslkeylog.txt"}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"tls-1","method":"tools/call","params":{"name":"analyze_ssl_tls","arguments":{"pcapPath":"D:/captures/demo.pcap","sslKeylogPath":"D:/captures/sslkeylog.txt"}}}
 ```
 
 **返回内容**：JSON 格式报告，包含：
@@ -405,11 +427,13 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"threat-1","method":"tools/call","params":{"name":"check_threats","arguments":{"interface":"eth0","duration":15}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"threat-1","method":"tools/call","params":{"name":"check_threats","arguments":{"interface":"eth0","duration":15}}}
 ```
 
 **返回内容**：捕获到的所有 IP 列表 + URLhaus 黑名单匹配结果。
@@ -432,11 +456,13 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"ip-1","method":"tools/call","params":{"name":"check_ip_threats","arguments":{"ip":"185.220.101.45"}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"ip-1","method":"tools/call","params":{"name":"check_ip_threats","arguments":{"ip":"185.220.101.45"}}}
 ```
 
 **返回内容**：IP 地址 + 是否在 URLhaus 黑名单中。
@@ -470,29 +496,35 @@ curl -s -X POST http://localhost:10001/mcp \
 
 **调用示例 — 提取 HTTP 响应体**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"tshark-1","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-T fields -e http.file_data -Y \"http.response\""}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"tshark-1","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-T fields -e http.file_data -Y \"http.response\""}}}
 ```
 
 **调用示例 — 提取 HTTP 请求详情**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"tshark-2","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-Y \"http.request\" -T fields -e http.request.method -e http.request.uri -e http.host -e ip.src -e ip.dst"}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"tshark-2","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-Y \"http.request\" -T fields -e http.request.method -e http.request.uri -e http.host -e ip.src -e ip.dst"}}}
 ```
 
 **调用示例 — 按内容匹配搜索**：
 
-```bash
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"tshark-3","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-T fields -e http.host -e http.request.uri -Y \"http.request.uri contains \\\"flag\\\"\""}}}'
+```
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"tshark-3","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-T fields -e http.host -e http.request.uri -Y \"http.request.uri contains \\\"flag\\\"\""}}}
 ```
 
 **注意事项**：
@@ -533,112 +565,142 @@ curl -s -X POST http://localhost:10001/mcp \
 
 ### 6.1 场景：排查"网站访问超时"
 
-```bash
+```
 # 1. 快速概览 PCAP
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf1-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapPath":"D:/captures/timeout.pcap"}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf1-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapPath":"D:/captures/timeout.pcap"}}}
 
 # 2. 诊断 TCP 层问题
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf1-2","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapPath":"D:/captures/timeout.pcap","tsharkArgs":"-Y \"tcp\""}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf1-2","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapPath":"D:/captures/timeout.pcap","tsharkArgs":"-Y \"tcp\""}}}
 
 # 3. 诊断 HTTP 层问题
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf1-3","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/timeout.pcap","tsharkArgs":"-Y \"http\""}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf1-3","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/timeout.pcap","tsharkArgs":"-Y \"http\""}}}
 ```
 
 ### 6.2 场景：HTTPS 流量解密分析
 
-```bash
+```
 # 1. TLS 解密 + HTTP 明文分析
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf2-1","method":"tools/call","params":{"name":"analyze_ssl_tls","arguments":{"pcapPath":"D:/captures/https.pcap","sslKeylogPath":"D:/captures/sslkeylog.txt"}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf2-1","method":"tools/call","params":{"name":"analyze_ssl_tls","arguments":{"pcapPath":"D:/captures/https.pcap","sslKeylogPath":"D:/captures/sslkeylog.txt"}}}
 
 # 2. 对解密发现的问题做进一步应用层诊断
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf2-2","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/https.pcap","tsharkArgs":"-Y \"http\""}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf2-2","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/https.pcap","tsharkArgs":"-Y \"http\""}}}
 ```
 
 ### 6.3 场景：CTF 流量取证
 
-```bash
+```
 # 1. 快速概览
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf3-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapPath":"D:/ctf/challenge.pcap"}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf3-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapPath":"D:/ctf/challenge.pcap"}}}
 
 # 2. 提取凭据
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf3-2","method":"tools/call","params":{"name":"extract_credentials","arguments":{"pcapPath":"D:/ctf/challenge.pcap"}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf3-2","method":"tools/call","params":{"name":"extract_credentials","arguments":{"pcapPath":"D:/ctf/challenge.pcap"}}}
 
 # 3. 按关键字搜索隐藏内容
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf3-3","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/ctf/challenge.pcap","tsharkArgs":"-T fields -e http.request.uri -Y \"http.request.uri contains \\\"flag\\\"\""}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf3-3","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/ctf/challenge.pcap","tsharkArgs":"-T fields -e http.request.uri -Y \"http.request.uri contains \\\"flag\\\"\""}}}
 ```
 
 ### 6.4 场景：实时威胁监控
 
-```bash
+```
 # 1. 抓包 15 秒 + URLhaus 比对
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf4-1","method":"tools/call","params":{"name":"check_threats","arguments":{"interface":"eth0","duration":15}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf4-1","method":"tools/call","params":{"name":"check_threats","arguments":{"interface":"eth0","duration":15}}}
 
 # 2. 对命中 IP 做二次确认
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf4-2","method":"tools/call","params":{"name":"check_ip_threats","arguments":{"ip":"185.220.101.45"}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf4-2","method":"tools/call","params":{"name":"check_ip_threats","arguments":{"ip":"185.220.101.45"}}}
 ```
 
 ### 6.5 场景：并发连接问题诊断
 
-```bash
+```
 # 1. 协议层次统计
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf5-1","method":"tools/call","params":{"name":"get_summary_stats","arguments":{"pcapPath":"D:/captures/connection.pcap"}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf5-1","method":"tools/call","params":{"name":"get_summary_stats","arguments":{"pcapPath":"D:/captures/connection.pcap"}}}
 
 # 2. TCP 会话统计
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf5-2","method":"tools/call","params":{"name":"get_conversations","arguments":{"pcapPath":"D:/captures/connection.pcap"}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf5-2","method":"tools/call","params":{"name":"get_conversations","arguments":{"pcapPath":"D:/captures/connection.pcap"}}}
 
 # 3. 传输层诊断
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf5-3","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapPath":"D:/captures/connection.pcap","tsharkArgs":"-Y \"tcp\""}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf5-3","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapPath":"D:/captures/connection.pcap","tsharkArgs":"-Y \"tcp\""}}}
 
 # 4. 应用层诊断
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf5-4","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/connection.pcap","tsharkArgs":"-Y \"http\""}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf5-4","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/connection.pcap","tsharkArgs":"-Y \"http\""}}}
 
 # 5. 提取 HTTP 请求详情
-curl -s -X POST http://localhost:10001/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":"wf5-5","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/connection.pcap","tsharkArgs":"-Y \"http.request\" -T fields -e http.request.method -e http.request.uri -e http.host -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e frame.time_relative"}}}'
+POST /mcp HTTP/1.1
+Host: localhost:10001
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":"wf5-5","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/connection.pcap","tsharkArgs":"-Y \"http.request\" -T fields -e http.request.method -e http.request.uri -e http.host -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e frame.time_relative"}}}
 ```
 
 ---
@@ -666,4 +728,3 @@ curl -s -X POST http://localhost:10001/mcp \
 - **Node.js** >= 18
 - **Wireshark/tshark**：必须安装并在 PATH 中可访问
 - **网络权限**：实时抓包工具（`capture_packets`、`check_threats`）需要 root/Administrator 权限运行 tshark
-

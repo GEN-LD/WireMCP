@@ -18,6 +18,9 @@ yarn.lock
 *.pcapng
 captures/
 
+# Uploaded files (runtime user data)
+uploads/
+
 # Operating System
 .DS_Store
 .DS_Store?

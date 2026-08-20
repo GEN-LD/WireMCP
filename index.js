@@ -17,6 +17,7 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod');
 const express = require('express');
+const multer = require('multer');
 
 // Redirect console.log to stderr
 const originalConsoleLog = console.log;
@@ -85,6 +86,94 @@ async function validateKeylogPath(p) {
   await fs.access(resolved);
   return resolved;
 }
+
+/**
+ * 校验上传请求的 user_id
+ * 仅允许字母、数字、下划线、连字符，长度 1~128
+ * 正则已排除 "."、"/"、"\\"、空字符等，从根本上阻断路径穿越
+ */
+function validateUserId(id) {
+  if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(id)) {
+    throw new Error(`Invalid user_id: "${id}". Only letters, digits, underscore and hyphen are allowed, length 1-128.`);
+  }
+  return id;
+}
+
+/**
+ * 校验上传请求的 session_id
+ * 规则同 user_id
+ */
+function validateSessionId(id) {
+  if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(id)) {
+    throw new Error(`Invalid session_id: "${id}". Only letters, digits, underscore and hyphen are allowed, length 1-128.`);
+  }
+  return id;
+}
+
+/**
+ * 净化上传文件名并校验扩展名白名单
+ * path.basename 剥离任何目录部分，防止 "../../etc/passwd" 类路径穿越攻击
+ * @param {string} originalname - 客户端提供的原始文件名
+ * @returns {{ filename: string, ext: string }} 净化后的文件名与小写扩展名
+ */
+function sanitizeUploadFilename(originalname) {
+  if (typeof originalname !== 'string' || !originalname) {
+    throw new Error('Missing upload filename.');
+  }
+  const filename = path.basename(originalname);
+  const ext = path.extname(filename).toLowerCase();
+  if (!UPLOAD_ALLOWED_EXTENSIONS.includes(ext)) {
+    throw new Error(
+      `Unsupported file extension: "${ext}". Allowed extensions: ${UPLOAD_ALLOWED_EXTENSIONS.join(', ')}`
+    );
+  }
+  return { filename, ext };
+}
+
+// 上传文件配置
+const UPLOAD_BASE_DIR = path.join(__dirname, 'uploads');
+const UPLOAD_TMP_DIR = path.join(UPLOAD_BASE_DIR, '.tmp');
+const UPLOAD_MAX_SIZE = 100 * 1024 * 1024;
+const UPLOAD_ALLOWED_EXTENSIONS = ['.pcap', '.pcapng', '.txt', '.log'];
+
+/**
+ * 文件上传 multer 实例
+ * 采用"先写临时目录、校验通过后再移动"的两阶段策略：
+ *   1. multer 先将文件写入项目内临时目录（与目标目录同盘，避免跨盘 rename 触发 EXDEV）
+ *   2. 路由处理器校验 user_id/session_id/扩展名通过后，再移动到 user_id/session_id 目录
+ * 这样即便 multipart 中文本字段出现在文件字段之后，也能可靠完成校验
+ */
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      fs.mkdir(UPLOAD_TMP_DIR, { recursive: true })
+        .then(() => cb(null, UPLOAD_TMP_DIR))
+        .catch(err => cb(err));
+    },
+    filename: (req, file, cb) => {
+      cb(null, `wiremcp_upload_${crypto.randomUUID()}`);
+    }
+  }),
+  limits: { fileSize: UPLOAD_MAX_SIZE }
+});
+
+/**
+ * 包裹 upload.single('file')，将 multer 错误（如超限）转为 JSON 响应而非透传给默认错误处理器
+ */
+const uploadSingleFile = (req, res, next) => {
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({
+          success: false,
+          error: `文件大小超过上限（${UPLOAD_MAX_SIZE / 1024 / 1024}MB）。`
+        });
+      }
+      return res.status(400).json({ success: false, error: err.message });
+    }
+    next();
+  });
+};
 
 /**
  * 解码 tshark 输出中的十六进制字段
@@ -2718,9 +2807,69 @@ async function main() {
       return server;
     };
 
+    /**
+     * 创建令牌桶 QPS 限流中间件（全局共享一个桶）
+     * 容量 = maxQps，按经过时间匀速补充令牌；请求到达消耗 1 个，不足则拒绝
+     * Node 单线程，限流检查为同步操作，天然原子安全
+     * @param {number} maxQps - 每秒最大请求数（=令牌桶容量）
+     * @param {string} routeName - 路由名，用于日志标识
+     */
+    function createTokenBucketQpsLimiter(maxQps, routeName) {
+      let tokens = maxQps;
+      let lastRefill = Date.now();
+      return (req, res, next) => {
+        const now = Date.now();
+        const elapsed = (now - lastRefill) / 1000;
+        tokens = Math.min(maxQps, tokens + elapsed * maxQps);
+        lastRefill = now;
+        if (tokens >= 1) {
+          tokens -= 1;
+          return next();
+        }
+        console.error(
+          `[rate-limit] ${new Date().toISOString()} ${routeName} QPS limit (${maxQps}/s) exceeded, rejected tokens=${tokens.toFixed(2)} client=${req.ip}`
+        );
+        res.status(429).json({
+          jsonrpc: '2.0',
+          error: { code: -32603, message: `Rate limit exceeded: max ${maxQps} QPS` },
+          id: null,
+        });
+      };
+    }
+
+    /**
+     * 创建并发数限流中间件
+     * 内存计数器，进入时 +1，响应关闭时 -1；超过 maxConcurrent 则拒绝
+     * 递减挂在 res 'close' 事件，覆盖成功/校验失败/中间件报错/客户端断连全部路径
+     * @param {number} maxConcurrent - 最大并发数
+     * @param {string} routeName - 路由名，用于日志标识
+     */
+    function createConcurrencyLimiter(maxConcurrent, routeName) {
+      let inflight = 0;
+      return (req, res, next) => {
+        if (inflight >= maxConcurrent) {
+          console.error(
+            `[concurrency] ${new Date().toISOString()} ${routeName} concurrency limit (${maxConcurrent}) reached, rejected inflight=${inflight} client=${req.ip}`
+          );
+          return res.status(429).json({
+            success: false,
+            error: `Concurrency limit (${maxConcurrent}) reached, please retry later`,
+          });
+        }
+        inflight++;
+        res.on('close', () => {
+          inflight--;
+        });
+        next();
+      };
+    }
+
+    const mcpQpsLimiter = createTokenBucketQpsLimiter(50, '/mcp/wiremcp');
+    const uploadConcurrencyLimiter = createConcurrencyLimiter(20, '/mcp/upload');
+
     const app = express();
     app.use(express.json());
-    app.all('/mcp', async (req, res) => {
+    app.all('/mcp/wiremcp', mcpQpsLimiter, async (req, res) => {
       const server = getServer();
       try {
         const transport = new StreamableHTTPServerTransport({
@@ -2746,22 +2895,77 @@ async function main() {
       }
     });
     // Reject GET/DELETE (stateless mode)
-    app.get('/mcp', (req, res) => {
+    app.get('/mcp/wiremcp', (req, res) => {
       res.status(405).json({
         jsonrpc: '2.0',
         error: { code: -32000, message: 'Method not allowed' },
         id: null,
       });
     });
-    app.delete('/mcp', (req, res) => {
+    app.delete('/mcp/wiremcp', (req, res) => {
       res.status(405).json({
         jsonrpc: '2.0',
         error: { code: -32000, message: 'Method not allowed' },
         id: null,
       });
     });
+
+    // 文件上传接口：接收单个文件，存放到 uploads/<user_id>/<session_id>/ 目录（不存在则创建）
+    // 一次请求只上传一个文件（字段名 file），多个文件需多次请求
+    app.post('/mcp/upload', uploadConcurrencyLimiter, uploadSingleFile, async (req, res) => {
+      let tempFilePath = null;
+      try {
+        const userId = validateUserId(req.body.user_id);
+        const sessionId = validateSessionId(req.body.session_id);
+        if (!req.file) {
+          return res.status(400).json({
+            success: false,
+            error: 'Missing upload file (multipart field name should be file).',
+          });
+        }
+        tempFilePath = req.file.path;
+        const { filename, ext } = sanitizeUploadFilename(req.file.originalname);
+
+        const targetDir = path.join(UPLOAD_BASE_DIR, userId, sessionId);
+        await fs.mkdir(targetDir, { recursive: true });
+
+        const targetPath = path.join(targetDir, filename);
+        await fs.rename(tempFilePath, targetPath);
+        tempFilePath = null;
+
+        console.error(
+          `[upload] file saved: user=${userId}, session=${sessionId}, file=${filename}, size=${req.file.size}bytes`
+        );
+
+        res.json({
+          success: true,
+          user_id: userId,
+          session_id: sessionId,
+          filename,
+          extension: ext,
+          size: req.file.size,
+          savedPath: targetPath,
+        });
+      } catch (error) {
+        console.error(`[upload] upload failed: ${error.message}`);
+        const msg = error.message || 'upload failed';
+        if (msg.includes('user_id') || msg.includes('session_id') ||
+            msg.includes('extension') || msg.includes('Missing')) {
+          return res.status(400).json({ success: false, error: msg });
+        }
+        return res.status(500).json({ success: false, error: msg });
+      } finally {
+        if (tempFilePath) {
+          await fs.unlink(tempFilePath).catch(e =>
+            console.error(`[upload] failed to clean temp file: ${e.message}`)
+          );
+        }
+      }
+    });
+
     app.listen(port, () => {
-      console.error(`WireMCP HTTP server listening on http://localhost:${port}/mcp (stateless mode, SSE=${isSse})`);
+      console.error(`WireMCP HTTP server listening on http://localhost:${port}/mcp/wiremcp (stateless mode, SSE=${isSse})`);
+      console.error(`WireMCP upload endpoint: POST http://localhost:${port}/mcp/upload`);
     });
   } else {
     // STDIO mode (default, original behavior)

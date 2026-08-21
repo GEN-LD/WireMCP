@@ -180,7 +180,9 @@ data: {"result":{"content":[{"type":"text","text":"Error: tshark not found"}],"i
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `pcapPath` | string | 是 | PCAP 文件路径（支持 `.pcap` `.pcapng` `.cap`） |
+| `pcapFileName` | string | 是 | PCAP 文件名称（仅文件名，支持 `.pcap` `.pcapng` `.cap`） |
+| `user_id` | string | 是 | 用户 ID |
+| `session_id` | string | 是 | 会话 ID |
 
 **调用示例**：
 
@@ -190,7 +192,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"pcap-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}
+{"jsonrpc":"2.0","id":"pcap-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1"}}}
 ```
 
 **返回内容**：唯一 IP 列表、URL 列表、协议列表、数据包 JSON 数据及截断信息。输出超过 200KB 时自动截断。
@@ -209,7 +211,9 @@ Accept: application/json, text/event-stream
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `pcapPath` | string | 是 | PCAP 文件路径 |
+| `pcapFileName` | string | 是 | PCAP 文件名称 |
+| `user_id` | string | 是 | 用户 ID |
+| `session_id` | string | 是 | 会话 ID |
 
 **调用示例**：
 
@@ -219,7 +223,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"stats-1","method":"tools/call","params":{"name":"get_summary_stats","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}
+{"jsonrpc":"2.0","id":"stats-1","method":"tools/call","params":{"name":"get_summary_stats","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1"}}}
 ```
 
 **返回内容**：tshark 协议层次树，展示各协议层的数据包数、字节数、占比。
@@ -238,7 +242,9 @@ Accept: application/json, text/event-stream
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `pcapPath` | string | 是 | PCAP 文件路径 |
+| `pcapFileName` | string | 是 | PCAP 文件名称 |
+| `user_id` | string | 是 | 用户 ID |
+| `session_id` | string | 是 | 会话 ID |
 
 **调用示例**：
 
@@ -248,7 +254,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"conv-1","method":"tools/call","params":{"name":"get_conversations","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}
+{"jsonrpc":"2.0","id":"conv-1","method":"tools/call","params":{"name":"get_conversations","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1"}}}
 ```
 
 **返回内容**：TCP 会话统计表，包含正向/反向字节数、帧数、持续时间。输出超过 100KB 时自动截断。
@@ -267,7 +273,9 @@ Accept: application/json, text/event-stream
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `pcapPath` | string | 是 | PCAP 文件路径 |
+| `pcapFileName` | string | 是 | PCAP 文件名称 |
+| `user_id` | string | 是 | 用户 ID |
+| `session_id` | string | 是 | 会话 ID |
 
 **调用示例**：
 
@@ -277,7 +285,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"cred-1","method":"tools/call","params":{"name":"extract_credentials","arguments":{"pcapPath":"D:/captures/demo.pcap"}}}
+{"jsonrpc":"2.0","id":"cred-1","method":"tools/call","params":{"name":"extract_credentials","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1"}}}
 ```
 
 **返回内容**：
@@ -298,7 +306,9 @@ Accept: application/json, text/event-stream
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `pcapPath` | string | 是 | PCAP 文件路径 |
+| `pcapFileName` | string | 是 | PCAP 文件名称 |
+| `user_id` | string | 是 | 用户 ID |
+| `session_id` | string | 是 | 会话 ID |
 | `tsharkArgs` | string | 是 | tshark 过滤参数，用于缩小分析范围。如 `-Y "ip.addr == 10.0.0.1"` 或 `-Y "http"` |
 
 **调用示例**：
@@ -309,7 +319,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"l4-1","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-Y \"ip.addr == 192.168.1.100\""}}}
+{"jsonrpc":"2.0","id":"l4-1","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-Y \"ip.addr == 192.168.1.100\""}}}
 ```
 
 **返回内容**：JSON 格式报告，包含每个 TCP 流的问题列表、问题类型、详细描述。
@@ -328,7 +338,9 @@ Accept: application/json, text/event-stream
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `pcapPath` | string | 是 | PCAP 文件路径 |
+| `pcapFileName` | string | 是 | PCAP 文件名称 |
+| `user_id` | string | 是 | 用户 ID |
+| `session_id` | string | 是 | 会话 ID |
 | `tsharkArgs` | string | 是 | tshark 过滤参数，如 `-Y "http"` 或 `-Y "ip.addr == 10.0.0.1"` |
 
 **调用示例**：
@@ -339,7 +351,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"l7-1","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-Y \"http\""}}}
+{"jsonrpc":"2.0","id":"l7-1","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-Y \"http\""}}}
 ```
 
 **返回内容**：JSON 格式报告，包含每个流/事务的应用层问题列表。
@@ -358,8 +370,10 @@ Accept: application/json, text/event-stream
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `pcapPath` | string | 是 | PCAP 文件路径 |
-| `sslKeylogPath` | string | 是 | SSLKEYLOGFILE 文件路径（NSS Key Log 格式，通常为 `.txt` 或 `.log`） |
+| `pcapFileName` | string | 是 | PCAP 文件名称 |
+| `user_id` | string | 是 | 用户 ID |
+| `session_id` | string | 是 | 会话 ID |
+| `keylogFileName` | string | 是 | SSLKEYLOGFILE 文件名称（NSS Key Log 格式，通常为 `.txt` 或 `.log`） |
 
 **调用示例**：
 
@@ -369,7 +383,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"tls-1","method":"tools/call","params":{"name":"analyze_ssl_tls","arguments":{"pcapPath":"D:/captures/demo.pcap","sslKeylogPath":"D:/captures/sslkeylog.txt"}}}
+{"jsonrpc":"2.0","id":"tls-1","method":"tools/call","params":{"name":"analyze_ssl_tls","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1","keylogFileName":"sslkeylog.txt"}}}
 ```
 
 **返回内容**：JSON 格式报告，包含：
@@ -420,7 +434,9 @@ Accept: application/json, text/event-stream
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `pcapPath` | string | 是 | PCAP 文件路径 |
+| `pcapFileName` | string | 是 | PCAP 文件名称 |
+| `user_id` | string | 是 | 用户 ID |
+| `session_id` | string | 是 | 会话 ID |
 | `tsharkArgs` | string | 是 | tshark 参数字符串，如 `-T fields -e http.host -Y "http.request"` |
 
 **常用 tsharkArgs 示例**：
@@ -441,7 +457,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"tshark-1","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-T fields -e http.file_data -Y \"http.response\""}}}
+{"jsonrpc":"2.0","id":"tshark-1","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-T fields -e http.file_data -Y \"http.response\""}}}
 ```
 
 **调用示例 — 提取 HTTP 请求详情**：
@@ -452,7 +468,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"tshark-2","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-Y \"http.request\" -T fields -e http.request.method -e http.request.uri -e http.host -e ip.src -e ip.dst"}}}
+{"jsonrpc":"2.0","id":"tshark-2","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-Y \"http.request\" -T fields -e http.request.method -e http.request.uri -e http.host -e ip.src -e ip.dst"}}}
 ```
 
 **调用示例 — 按内容匹配搜索**：
@@ -463,7 +479,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"tshark-3","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/demo.pcap","tsharkArgs":"-T fields -e http.host -e http.request.uri -Y \"http.request.uri contains \\\"flag\\\"\""}}}
+{"jsonrpc":"2.0","id":"tshark-3","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapFileName":"demo.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-T fields -e http.host -e http.request.uri -Y \"http.request.uri contains \\\"flag\\\"\""}}}
 ```
 
 **注意事项**：
@@ -507,7 +523,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf1-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapPath":"D:/captures/timeout.pcap"}}}
+{"jsonrpc":"2.0","id":"wf1-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapFileName":"timeout.pcap","user_id":"u1","session_id":"s1"}}}
 
 # 2. 诊断 TCP 层问题
 POST /mcp HTTP/1.1
@@ -515,7 +531,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf1-2","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapPath":"D:/captures/timeout.pcap","tsharkArgs":"-Y \"tcp\""}}}
+{"jsonrpc":"2.0","id":"wf1-2","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapFileName":"timeout.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-Y \"tcp\""}}}
 
 # 3. 诊断 HTTP 层问题
 POST /mcp HTTP/1.1
@@ -523,7 +539,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf1-3","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/timeout.pcap","tsharkArgs":"-Y \"http\""}}}
+{"jsonrpc":"2.0","id":"wf1-3","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapFileName":"timeout.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-Y \"http\""}}}
 ```
 
 ### 6.2 场景：HTTPS 流量解密分析
@@ -535,7 +551,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf2-1","method":"tools/call","params":{"name":"analyze_ssl_tls","arguments":{"pcapPath":"D:/captures/https.pcap","sslKeylogPath":"D:/captures/sslkeylog.txt"}}}
+{"jsonrpc":"2.0","id":"wf2-1","method":"tools/call","params":{"name":"analyze_ssl_tls","arguments":{"pcapFileName":"https.pcap","user_id":"u1","session_id":"s1","keylogFileName":"sslkeylog.txt"}}}
 
 # 2. 对解密发现的问题做进一步应用层诊断
 POST /mcp HTTP/1.1
@@ -543,7 +559,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf2-2","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/https.pcap","tsharkArgs":"-Y \"http\""}}}
+{"jsonrpc":"2.0","id":"wf2-2","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapFileName":"https.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-Y \"http\""}}}
 ```
 
 ### 6.3 场景：CTF 流量取证
@@ -555,7 +571,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf3-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapPath":"D:/ctf/challenge.pcap"}}}
+{"jsonrpc":"2.0","id":"wf3-1","method":"tools/call","params":{"name":"analyze_pcap","arguments":{"pcapFileName":"challenge.pcap","user_id":"u1","session_id":"s1"}}}
 
 # 2. 提取凭据
 POST /mcp HTTP/1.1
@@ -563,7 +579,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf3-2","method":"tools/call","params":{"name":"extract_credentials","arguments":{"pcapPath":"D:/ctf/challenge.pcap"}}}
+{"jsonrpc":"2.0","id":"wf3-2","method":"tools/call","params":{"name":"extract_credentials","arguments":{"pcapFileName":"challenge.pcap","user_id":"u1","session_id":"s1"}}}
 
 # 3. 按关键字搜索隐藏内容
 POST /mcp HTTP/1.1
@@ -571,7 +587,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf3-3","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/ctf/challenge.pcap","tsharkArgs":"-T fields -e http.request.uri -Y \"http.request.uri contains \\\"flag\\\"\""}}}
+{"jsonrpc":"2.0","id":"wf3-3","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapFileName":"challenge.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-T fields -e http.request.uri -Y \"http.request.uri contains \\\"flag\\\"\""}}}
 ```
 
 ### 6.5 场景：并发连接问题诊断
@@ -583,7 +599,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf5-1","method":"tools/call","params":{"name":"get_summary_stats","arguments":{"pcapPath":"D:/captures/connection.pcap"}}}
+{"jsonrpc":"2.0","id":"wf5-1","method":"tools/call","params":{"name":"get_summary_stats","arguments":{"pcapFileName":"connection.pcap","user_id":"u1","session_id":"s1"}}}
 
 # 2. TCP 会话统计
 POST /mcp HTTP/1.1
@@ -591,7 +607,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf5-2","method":"tools/call","params":{"name":"get_conversations","arguments":{"pcapPath":"D:/captures/connection.pcap"}}}
+{"jsonrpc":"2.0","id":"wf5-2","method":"tools/call","params":{"name":"get_conversations","arguments":{"pcapFileName":"connection.pcap","user_id":"u1","session_id":"s1"}}}
 
 # 3. 传输层诊断
 POST /mcp HTTP/1.1
@@ -599,7 +615,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf5-3","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapPath":"D:/captures/connection.pcap","tsharkArgs":"-Y \"tcp\""}}}
+{"jsonrpc":"2.0","id":"wf5-3","method":"tools/call","params":{"name":"analyze_l4_network","arguments":{"pcapFileName":"connection.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-Y \"tcp\""}}}
 
 # 4. 应用层诊断
 POST /mcp HTTP/1.1
@@ -607,7 +623,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf5-4","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapPath":"D:/captures/connection.pcap","tsharkArgs":"-Y \"http\""}}}
+{"jsonrpc":"2.0","id":"wf5-4","method":"tools/call","params":{"name":"analyze_l7_network","arguments":{"pcapFileName":"connection.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-Y \"http\""}}}
 
 # 5. 提取 HTTP 请求详情
 POST /mcp HTTP/1.1
@@ -615,7 +631,7 @@ Host: localhost:10001
 Content-Type: application/json
 Accept: application/json, text/event-stream
 
-{"jsonrpc":"2.0","id":"wf5-5","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/captures/connection.pcap","tsharkArgs":"-Y \"http.request\" -T fields -e http.request.method -e http.request.uri -e http.host -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e frame.time_relative"}}}
+{"jsonrpc":"2.0","id":"wf5-5","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapFileName":"connection.pcap","user_id":"u1","session_id":"s1","tsharkArgs":"-Y \"http.request\" -T fields -e http.request.method -e http.request.uri -e http.host -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e frame.time_relative"}}}
 ```
 
 ---

@@ -26,40 +26,42 @@ console.log = (...args) => console.error(...args);
 // 在所有使用用户输入调用系统命令之前，必须先经过这些校验函数
 
 /**
- * 校验 pcap 文件路径
- * 规范化为绝对路径，禁止路径穿越（包含 ".."），并检查文件是否存在
+ * 通过 user_id + session_id + fileName 解析上传文件的绝对路径
+ * 三重安全校验：
+ *   1. user_id/session_id 正则校验（仅字母数字下划线连字符，从根本上阻断路径穿越）
+ *   2. path.basename(fileName) 剥离任何目录部分，防止 "../../etc/passwd" 类路径穿越
+ *   3. 扩展名白名单校验
+ * @param {string} fileName - 文件名（仅文件名，不含路径）
+ * @param {string} userId - 用户 ID
+ * @param {string} sessionId - 会话 ID
+ * @param {string[]} allowedExts - 允许的扩展名白名单
+ * @returns {Promise<string>} 安全的绝对路径
  */
-async function validatePcapPath(p) {
-  const ALLOWED_EXTENSIONS = ['.pcap', '.pcapng', '.cap'];
+async function resolveUploadPath(fileName, userId, sessionId, allowedExts) {
+  validateUserId(userId);
+  validateSessionId(sessionId);
 
-  if (typeof p !== 'string' || p.includes('..') || p.includes('\0')) {
-    throw new Error(`非法的文件路径: "${p}"。路径中不允许包含 ".." 或空字符。`);
+  if (typeof fileName !== 'string' || !fileName) {
+    throw new Error('文件名不能为空。');
   }
-  const resolved = path.resolve(p);
-  const ext = path.extname(resolved).toLowerCase();
 
-  if (!ALLOWED_EXTENSIONS.includes(ext)) {
+  const safeFileName = path.basename(fileName);
+  const ext = path.extname(safeFileName).toLowerCase();
+  if (!allowedExts.includes(ext)) {
     throw new Error(
-      `不支持的文件扩展名: "${ext}"。仅允许以下扩展名: ${ALLOWED_EXTENSIONS.join(', ')}\n` +
-      `请确保文件为标准的 PCAP 格式。`
+      `不支持的文件扩展名: "${ext}"。仅允许: ${allowedExts.join(', ')}`
     );
   }
 
-  await fs.access(resolved);
-  return resolved;
-}
-
-/**
- * 校验 SSLKEYLOGFILE 路径
- * 规范化为绝对路径，禁止路径穿越（包含 ".."），并检查文件是否存在
- * 允许 .txt、.log 或无扩展名的常见 keylog 文件
- */
-async function validateKeylogPath(p) {
-  if (typeof p !== 'string' || p.includes('..') || p.includes('\0')) {
-    throw new Error(`非法的文件路径: "${p}"。路径中不允许包含 ".." 或空字符。`);
+  const resolved = path.join(UPLOAD_BASE_DIR, userId, sessionId, safeFileName);
+  try {
+    await fs.access(resolved);
+  } catch {
+    throw new Error(
+      `文件不存在: ${safeFileName} (user_id=${userId}, session_id=${sessionId})。` +
+      `请先通过 POST /mcp/upload 上传该文件。`
+    );
   }
-  const resolved = path.resolve(p);
-  await fs.access(resolved);
   return resolved;
 }
 
@@ -110,7 +112,9 @@ function sanitizeUploadFilename(originalname) {
 const UPLOAD_BASE_DIR = path.join(__dirname, 'uploads');
 const UPLOAD_TMP_DIR = path.join(UPLOAD_BASE_DIR, '.tmp');
 const UPLOAD_MAX_SIZE = 100 * 1024 * 1024;
-const UPLOAD_ALLOWED_EXTENSIONS = ['.pcap', '.pcapng', '.txt', '.log'];
+const UPLOAD_ALLOWED_EXTENSIONS = ['.pcap', '.pcapng', '.cap', '.txt', '.log'];
+const PCAP_EXTENSIONS = ['.pcap', '.pcapng', '.cap'];
+const KEYLOG_EXTENSIONS = ['.txt', '.log'];
 
 /**
  * 文件上传 multer 实例
@@ -252,8 +256,8 @@ function validateTsharkArgs(args) {
       patterns: ['-r', '--read-file'],
       reason: '可能覆盖 PCAP 文件路径，读取非授权或恶意构造的文件',
       alternatives: [
-        'PCAP 文件路径已通过 pcapPath 参数指定，无需在 tsharkArgs 中重复设置 -r',
-        '如需分析多个文件，请多次调用 exec_tshark 工具，每次指定不同 pcapPath',
+        'PCAP 文件已通过 pcapFileName + user_id + session_id 参数定位，无需在 tsharkArgs 中重复设置 -r',
+        '如需分析多个文件，请多次调用 exec_tshark 工具，每次指定不同 pcapFileName',
         '如需合并分析，请使用其他工具在调用前合并 PCAP 文件'
       ]
     },
@@ -419,18 +423,18 @@ server.tool(
   'get_summary_stats',
   'Analyze a PCAP file and provide protocol hierarchy statistics for LLM analysis',
   {
-    pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+    pcapFileName: z.string().describe('待分析的PCAP文件名称（仅文件名，不含路径），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID（仅字母、数字、下划线、连字符）'),
+    session_id: z.string().describe('会话ID（仅字母、数字、下划线、连字符）'),
   },
   async (args) => {
     try {
       const tsharkPath = await findTshark();
-      const { pcapPath } = args;
-      console.error(`Analyzing summary stats for PCAP: ${pcapPath}`);
+      const { pcapFileName, user_id, session_id } = args;
+      console.error(`Analyzing summary stats for PCAP: ${pcapFileName} (user=${user_id}, session=${session_id})`);
 
-      // 【安全修复】使用 validatePcapPath 替代 fs.access，一并完成路径规范化、安全检查和存在性验证
-      const safePcapPath = await validatePcapPath(pcapPath);
+      const safePcapPath = await resolveUploadPath(pcapFileName, user_id, session_id, PCAP_EXTENSIONS);
 
-      // 【安全修复】使用 execFileAsync + 参数数组，pcapPath 作为独立参数传入，不经过 shell
       const { stdout, stderr } = await execFileAsync(
         tsharkPath,
         ['-r', safePcapPath, '-qz', 'io,phs'],
@@ -441,7 +445,7 @@ server.tool(
       return {
         content: [{
           type: 'text',
-          text: `Analyzed PCAP: ${pcapPath}\n\nProtocol hierarchy statistics:\n${stdout}`,
+          text: `Analyzed PCAP: ${pcapFileName}\n\nProtocol hierarchy statistics:\n${stdout}`,
         }],
       };
     } catch (error) {
@@ -456,16 +460,17 @@ server.tool(
   'get_conversations',
   'Analyze a PCAP file and provide TCP conversation statistics for LLM analysis',
   {
-    pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+    pcapFileName: z.string().describe('待分析的PCAP文件名称（仅文件名，不含路径），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID（仅字母、数字、下划线、连字符）'),
+    session_id: z.string().describe('会话ID（仅字母、数字、下划线、连字符）'),
   },
   async (args) => {
     try {
       const tsharkPath = await findTshark();
-      const { pcapPath } = args;
-      console.error(`Analyzing conversations in PCAP: ${pcapPath}`);
+      const { pcapFileName, user_id, session_id } = args;
+      console.error(`Analyzing conversations in PCAP: ${pcapFileName} (user=${user_id}, session=${session_id})`);
 
-      // 【路径安全处理】规范化路径并校验扩展名，防止路径穿越和文件类型混淆攻击
-      const safePcapPath = await validatePcapPath(pcapPath);
+      const safePcapPath = await resolveUploadPath(pcapFileName, user_id, session_id, PCAP_EXTENSIONS);
 
       const { stdout, stderr } = await execFileAsync(
         tsharkPath,
@@ -556,33 +561,26 @@ server.tool(
   'exec_tshark',
   'Execute a custom tshark command on a PCAP file for advanced network analysis when other tools are insufficient. NOTE: For HTTP content extraction, use "http.file_data" instead of "data-text-lines" (which only returns summaries). IMPORTANT: Filter values containing spaces or logical operators (&&, ||, !) MUST be wrapped in quotes, e.g., -Y "tcp.port == 80 && http.host contains \\"example\\""',
   {
-    pcapPath: z.string().describe('待分析的PCAP文件路径，例如：./demo.pcap'),
+    pcapFileName: z.string().describe('待分析的PCAP文件名称（仅文件名，不含路径），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID（仅字母、数字、下划线、连字符）'),
+    session_id: z.string().describe('会话ID（仅字母、数字、下划线、连字符）'),
     tsharkArgs: z.string().describe('tshark命令参数字符串，必须用引号包裹。如果参数内部也包含引号，需要转义。示例："-T fields -e http.host -Y \\"http.request.uri contains \\\\\\"flag\\\\\\"\\""。注意：所有包含空格或逻辑运算符（&&、||、!）的 -Y 过滤值都必须用引号包裹，例如：-Y \\"tcp.port == 80 && http.request.method == GET\\"'),
   },
   async (args) => {
     try {
-      // 查找tshark可执行文件路径
       const tsharkPath = await findTshark();
-      const { pcapPath, tsharkArgs } = args;
+      const { pcapFileName, user_id, session_id, tsharkArgs } = args;
       console.error(`执行自定义tshark命令: ${tsharkArgs}`);
-      console.error(`分析PCAP文件: ${pcapPath}`);
+      console.error(`分析PCAP文件: ${pcapFileName} (user=${user_id}, session=${session_id})`);
 
-      // 【路径安全处理】规范化路径并校验扩展名，防止路径穿越和文件类型混淆攻击
-      const safePcapPath = await validatePcapPath(pcapPath);
+      const safePcapPath = await resolveUploadPath(pcapFileName, user_id, session_id, PCAP_EXTENSIONS);
 
-      // 【参数解析】将用户输入的参数字符串解析为安全的参数数组
-      // 支持带引号的参数，例如：-Y "http.request.method == GET"
       const argsArray = parseTsharkArgs(tsharkArgs);
 
-      // 【参数安全校验】检测并阻止危险参数注入，发现不当使用时给出合法替代方案
       validateTsharkArgs(argsArray);
 
-      // 【构建完整命令参数】自动添加-r参数读取指定pcap文件，再拼接用户自定义参数
-      // 由于已校验 argsArray 不含 -r/--read-file，不会覆盖安全路径
       const fullArgs = ['-r', safePcapPath, ...argsArray];
 
-      // 【安全执行】使用execFileAsync执行命令，不经过shell解析，从根本上避免命令注入风险
-      // 设置10MB缓冲区，支持较大的分析结果输出
       const { stdout, stderr } = await execFileAsync(
         tsharkPath,
         fullArgs,
@@ -593,14 +591,13 @@ server.tool(
       );
       if (stderr) console.error(`tshark标准错误输出: ${stderr}`);
 
-      // 【十六进制解码】tshark -T fields 模式下二进制字段输出为hex，大模型无法直接理解
-      // 自动检测hex字段并解码为可读文本，二进制数据保留原始hex并标注[binary data]
       let output = decodeHexFields(stdout);
 
-      // 【JSON结构化输出】构建结果对象，方便LLM解析和分析
-      const command = `tshark -r ${pcapPath} ${tsharkArgs}`;
+      const command = `tshark -r ${pcapFileName} ${tsharkArgs}`;
       const result = {
-        pcapPath,
+        pcapFileName,
+        user_id,
+        session_id,
         command,
         output,
         truncated: false,
@@ -649,18 +646,17 @@ server.tool(
   'analyze_pcap',
   'Analyze a PCAP file and provide general packet data as JSON for LLM analysis',
   {
-    pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+    pcapFileName: z.string().describe('待分析的PCAP文件名称（仅文件名，不含路径），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID（仅字母、数字、下划线、连字符）'),
+    session_id: z.string().describe('会话ID（仅字母、数字、下划线、连字符）'),
   },
   async (args) => {
     try {
       const tsharkPath = await findTshark();
-      const { pcapPath } = args;
-      console.error(`Analyzing PCAP file: ${pcapPath}`);
+      const { pcapFileName, user_id, session_id } = args;
+      console.error(`Analyzing PCAP file: ${pcapFileName} (user=${user_id}, session=${session_id})`);
 
-      // 【安全修复】使用 validatePcapPath 替代 fs.access，一并完成路径规范化、安全检查和存在性验证
-      const safePcapPath = await validatePcapPath(pcapPath);
-
-      // 【安全修复】使用 execFileAsync + 参数数组，pcapPath 作为独立参数传入，不经过 shell
+      const safePcapPath = await resolveUploadPath(pcapFileName, user_id, session_id, PCAP_EXTENSIONS);
       const { stdout, stderr } = await execFileAsync(
         tsharkPath,
         ['-r', safePcapPath, '-T', 'json', '-e', 'frame.number', '-e', 'ip.src', '-e', 'ip.dst', '-e', 'tcp.srcport', '-e', 'tcp.dstport', '-e', 'udp.srcport', '-e', 'udp.dstport', '-e', 'http.host', '-e', 'http.request.uri', '-e', 'frame.protocols'],
@@ -698,7 +694,7 @@ server.tool(
         console.error(`Trimmed packets from ${totalPackets} to ${trimCount} to fit ${maxChars} chars`);
       }
 
-      const outputText = `Analyzed PCAP: ${pcapPath}\n\n` +
+      const outputText = `Analyzed PCAP: ${pcapFileName}\n\n` +
         `Unique IPs:\n${ips.join('\n')}\n\n` +
         `URLs:\n${urls.length > 0 ? urls.join('\n') : 'None'}\n\n` +
         `Protocols:\n${protocols.join('\n') || 'None'}\n\n` +
@@ -724,25 +720,24 @@ server.tool(
     'extract_credentials',
     'Extract potential credentials (HTTP Basic Auth, FTP, Telnet) from a PCAP file for LLM analysis',
     {
-      pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+      pcapFileName: z.string().describe('待分析的PCAP文件名称（仅文件名，不含路径），例如：demo.pcap'),
+      user_id: z.string().describe('用户ID（仅字母、数字、下划线、连字符）'),
+      session_id: z.string().describe('会话ID（仅字母、数字、下划线、连字符）'),
     },
     async (args) => {
       try {
         const tsharkPath = await findTshark();
-        const { pcapPath } = args;
-        console.error(`Extracting credentials from PCAP file: ${pcapPath}`);
+        const { pcapFileName, user_id, session_id } = args;
+        console.error(`Extracting credentials from PCAP file: ${pcapFileName} (user=${user_id}, session=${session_id})`);
   
-        // 【安全修复】使用 validatePcapPath 替代 fs.access，一并完成路径规范化、安全检查和存在性验证
-        const safePcapPath = await validatePcapPath(pcapPath);
+        const safePcapPath = await resolveUploadPath(pcapFileName, user_id, session_id, PCAP_EXTENSIONS);
   
-        // 【安全修复】使用 execFileAsync + 参数数组，pcapPath 作为独立参数传入，不经过 shell
         const { stdout: plaintextOut } = await execFileAsync(
           tsharkPath,
           ['-r', safePcapPath, '-T', 'fields', '-e', 'http.authbasic', '-e', 'ftp.request.command', '-e', 'ftp.request.arg', '-e', 'telnet.data', '-e', 'frame.number'],
           { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
         );
 
-        // 【安全修复】同上，使用 execFileAsync 参数数组方式提取 Kerberos 凭据
         const { stdout: kerberosOut } = await execFileAsync(
           tsharkPath,
           ['-r', safePcapPath, '-T', 'fields', '-e', 'kerberos.CNameString', '-e', 'kerberos.realm', '-e', 'kerberos.cipher', '-e', 'kerberos.type', '-e', 'kerberos.msg_type', '-e', 'frame.number'],
@@ -839,7 +834,7 @@ server.tool(
 
         console.error(`Found ${credentials.plaintext.length} plaintext and ${credentials.encrypted.length} encrypted credentials`);
 
-        const outputText = `Analyzed PCAP: ${pcapPath}\n\n` +
+      const outputText = `Analyzed PCAP: ${pcapFileName}\n\n` +
           `Plaintext Credentials:\n${credentials.plaintext.length > 0 ?
             credentials.plaintext.map(c =>
               c.type === 'Telnet Prompt' ?
@@ -874,16 +869,18 @@ server.tool(
     'analyze_l4_network',
     '分析PCAP文件中传输层网络问题。先用tshark过滤命中的数据包，找到关联的TCP流，再逐流分析是否存在SYN无响应、RST拒绝、SYN重传、SYN Flood、超时重传、零窗口、异常RST、挥手不完整等问题。返回JSON格式报告。',
     {
-      pcapPath: z.string().describe('待分析的PCAP文件路径，例如：./demo.pcap'),
+      pcapFileName: z.string().describe('待分析的PCAP文件名称（仅文件名，不含路径），例如：demo.pcap'),
+      user_id: z.string().describe('用户ID（仅字母、数字、下划线、连字符）'),
+      session_id: z.string().describe('会话ID（仅字母、数字、下划线、连字符）'),
       tsharkArgs: z.string().describe('tshark命令参数字符串，用于过滤目标数据包。支持 -Y 过滤表达式，例如：-Y "http" 或 -Y "ip.addr == 10.0.0.1"'),
     },
     async (args) => {
       try {
         const tsharkPath = await findTshark();
-        const { pcapPath, tsharkArgs } = args;
-        console.error(`[analyze_l4_network] 开始分析: pcapPath=${pcapPath}, tsharkArgs=${tsharkArgs}`);
+        const { pcapFileName, user_id, session_id, tsharkArgs } = args;
+        console.error(`[analyze_l4_network] 开始分析: pcapFileName=${pcapFileName}, user=${user_id}, session=${session_id}, tsharkArgs=${tsharkArgs}`);
 
-        const safePcapPath = await validatePcapPath(pcapPath);
+        const safePcapPath = await resolveUploadPath(pcapFileName, user_id, session_id, PCAP_EXTENSIONS);
         const parsedArgs = parseTsharkArgs(tsharkArgs);
 
         // 从用户参数中提取 -Y 过滤器（保留，用于后续分析命令）
@@ -924,7 +921,9 @@ server.tool(
 
         if (streamIndices.length === 0) {
           const result = {
-            pcapPath,
+            pcapFileName,
+            user_id,
+            session_id,
             filter: userFilter || null,
             totalStreams: 0,
             issues: [],
@@ -1210,7 +1209,9 @@ server.tool(
 
         // ── 构建 JSON 响应 ──
         const result = {
-          pcapPath,
+          pcapFileName,
+          user_id,
+          session_id,
           filter: userFilter || null,
           totalStreamsAnalyzed: streamIndices.length,
           streamsWithIssues: issues.length,
@@ -1250,16 +1251,18 @@ server.tool(
     'analyze_l7_network',
     '分析PCAP文件中应用层网络问题。先用tshark过滤命中的数据包，找到关联的TCP流和DNS事务，再逐流/逐事务分析是否存在HTTP 4xx/5xx错误、重定向循环、响应极慢、Content-Length不匹配、服务端提前FIN、DNS查询失败、DNS解析超时等问题。返回JSON格式报告。',
     {
-      pcapPath: z.string().describe('待分析的PCAP文件路径，例如：./demo.pcap'),
+      pcapFileName: z.string().describe('待分析的PCAP文件名称（仅文件名，不含路径），例如：demo.pcap'),
+      user_id: z.string().describe('用户ID（仅字母、数字、下划线、连字符）'),
+      session_id: z.string().describe('会话ID（仅字母、数字、下划线、连字符）'),
       tsharkArgs: z.string().describe('tshark命令参数字符串，用于过滤目标数据包。支持 -Y 过滤表达式，例如：-Y "http" 或 -Y "ip.addr == 10.0.0.1"'),
     },
     async (args) => {
       try {
         const tsharkPath = await findTshark();
-        const { pcapPath, tsharkArgs } = args;
-        console.error(`[analyze_l7_network] 开始分析: pcapPath=${pcapPath}, tsharkArgs=${tsharkArgs}`);
+        const { pcapFileName, user_id, session_id, tsharkArgs } = args;
+        console.error(`[analyze_l7_network] 开始分析: pcapFileName=${pcapFileName}, user=${user_id}, session=${session_id}, tsharkArgs=${tsharkArgs}`);
 
-        const safePcapPath = await validatePcapPath(pcapPath);
+        const safePcapPath = await resolveUploadPath(pcapFileName, user_id, session_id, PCAP_EXTENSIONS);
         const parsedArgs = parseTsharkArgs(tsharkArgs);
 
         // 从用户参数中提取 -Y 过滤器（复用 L4 的安全解析逻辑）
@@ -1315,7 +1318,9 @@ server.tool(
 
         if (streamIndices.length === 0 && dnsIds.length === 0) {
           const result = {
-            pcapPath,
+            pcapFileName,
+            user_id,
+            session_id,
             filter: userFilter || null,
             totalStreamsAnalyzed: 0,
             totalDnsTransactionsAnalyzed: 0,
@@ -1889,7 +1894,9 @@ server.tool(
 
         // ── 构建 JSON 响应 ──
         const result = {
-          pcapPath,
+          pcapFileName,
+          user_id,
+          session_id,
           filter: userFilter || null,
           totalStreamsAnalyzed: streamIndices.length,
           totalDnsTransactionsAnalyzed: dnsIds.length,
@@ -1930,17 +1937,19 @@ server.tool(
     'analyze_ssl_tls',
     '解密分析SSL/TLS流量：分析TLS握手安全信息（弱版本、弱密码等），并使用SSLKEYLOGFILE解密流量，分析获取HTTP明文内容（请求行为、响应摘要），检测4xx/5xx、重定向循环、响应过慢等HTTP问题。返回JSON格式报告。',
     {
-      pcapPath: z.string().describe('待分析的PCAP文件路径，例如：./demo.pcap'),
-      sslKeylogPath: z.string().describe('SSLKEYLOGFILE文件路径（NSS Key Log格式），例如：./sslkeylog.txt'),
+      pcapFileName: z.string().describe('待分析的PCAP文件名称（仅文件名，不含路径），例如：demo.pcap'),
+      keylogFileName: z.string().describe('SSLKEYLOGFILE文件名称（仅文件名，不含路径），例如：sslkeylog.txt'),
+      user_id: z.string().describe('用户ID（仅字母、数字、下划线、连字符）'),
+      session_id: z.string().describe('会话ID（仅字母、数字、下划线、连字符）'),
     },
     async (args) => {
       try {
         const tsharkPath = await findTshark();
-        const { pcapPath, sslKeylogPath: sslKeylogArg } = args;
-        console.error(`[analyze_ssl_tls] 开始分析: pcapPath=${pcapPath}, sslKeylogPath=${sslKeylogArg}`);
+        const { pcapFileName, keylogFileName, user_id, session_id } = args;
+        console.error(`[analyze_ssl_tls] 开始分析: pcapFileName=${pcapFileName}, keylogFileName=${keylogFileName}, user=${user_id}, session=${session_id}`);
 
-        const safePcapPath = await validatePcapPath(pcapPath);
-        const safeKeylogPath = await validateKeylogPath(sslKeylogArg);
+        const safePcapPath = await resolveUploadPath(pcapFileName, user_id, session_id, PCAP_EXTENSIONS);
+        const safeKeylogPath = await resolveUploadPath(keylogFileName, user_id, session_id, KEYLOG_EXTENSIONS);
 
         // ── Step 0: 配置 tshark 环境变量 ──
         const tsharkEnv = {
@@ -2056,8 +2065,10 @@ server.tool(
           ], execOpts);
           if (!tlsCheck.trim()) {
             const noTlsResult = {
-              pcapPath,
-              sslKeylogPath: sslKeylogArg,
+              pcapFileName,
+              keylogFileName,
+              user_id,
+              session_id,
               tlsHandshake: null,
               decryptedTraffic: null,
               httpIssues: [],
@@ -2361,8 +2372,10 @@ server.tool(
           .map(([host, count]) => ({ host, count }));
 
         const result = {
-          pcapPath,
-          sslKeylogPath: sslKeylogArg,
+          pcapFileName,
+          keylogFileName,
+          user_id,
+          session_id,
           tlsHandshake: {
             totalTlsStreams: tlsStreamIndices.length,
             handshakes,
@@ -2433,14 +2446,16 @@ function registerPrompts(server) {
 server.prompt(
   'summary_stats_prompt',
   {
-    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
+    pcapFileName: z.string().describe('待分析的 PCAP 文件名称（仅文件名），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID'),
+    session_id: z.string().describe('会话ID'),
   },
-  ({ pcapPath }) => ({
+  ({ pcapFileName, user_id, session_id }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `请分析 PCAP 文件 ${pcapPath} 的协议层级统计，重点关注：
+        text: `请分析 PCAP 文件 ${pcapFileName}（user_id=${user_id}, session_id=${session_id}）的协议层级统计，重点关注：
 1. 各协议占比与流量分布（tcp/udp/http/dns/tls 等的包数与字节数）
 2. 异常协议组合或非预期协议（如明文 telnet、可疑 C2 协议）
 3. 占比突出的协议是否反映业务特征或异常行为
@@ -2453,14 +2468,16 @@ server.prompt(
 server.prompt(
   'conversations_prompt',
   {
-    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
+    pcapFileName: z.string().describe('待分析的 PCAP 文件名称（仅文件名），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID'),
+    session_id: z.string().describe('会话ID'),
   },
-  ({ pcapPath }) => ({
+  ({ pcapFileName, user_id, session_id }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `请分析 PCAP 文件 ${pcapPath} 的 TCP 会话统计，重点关注：
+        text: `请分析 PCAP 文件 ${pcapFileName}（user_id=${user_id}, session_id=${session_id}）的 TCP 会话统计，重点关注：
 1. 最活跃的 IP 通信对（按包数/字节数排序）
 2. 会话时长与数据量分布，识别长连接或大流量会话
 3. 异常通信模式（非标准端口、扫描行为、单向流量等）
@@ -2493,16 +2510,18 @@ server.prompt(
 server.prompt(
   'exec_tshark_prompt',
   {
-    pcapPath: z.string().describe('PCAP文件路径'),
+    pcapFileName: z.string().describe('PCAP文件名称（仅文件名）'),
+    user_id: z.string().describe('用户ID'),
+    session_id: z.string().describe('会话ID'),
     tsharkArgs: z.string().optional().describe('可选的tshark参数提示'),
   },
-  ({ pcapPath, tsharkArgs = '' }) => ({
+  ({ pcapFileName, user_id, session_id, tsharkArgs = '' }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
         text: `【重要提示】当WireMCP的其他内置工具（如analyze_pcap、get_conversations、extract_credentials、check_ip_threats等）无法满足你的分析需求时，再使用exec_tshark工具执行自定义tshark命令。
-请分析PCAP文件 ${pcapPath}，需要获取特定数据时：
+请分析PCAP文件 ${pcapFileName}（user_id=${user_id}, session_id=${session_id}），需要获取特定数据时：
 1. 优先尝试使用WireMCP内置工具，内置工具提供了更优化的输出格式和安全保障
 2. 确认内置工具无法满足需求后，使用exec_tshark工具执行自定义tshark命令
 3. 常用tshark参数参考示例：
@@ -2536,14 +2555,16 @@ ${tsharkArgs ? `推荐使用的参数: ${tsharkArgs}` : ''}`
 server.prompt(
   'analyze_pcap_prompt',
   {
-    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
+    pcapFileName: z.string().describe('待分析的 PCAP 文件名称（仅文件名），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID'),
+    session_id: z.string().describe('会话ID'),
   },
-  ({ pcapPath }) => ({
+  ({ pcapFileName, user_id, session_id }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `请对 PCAP 文件 ${pcapPath} 进行总览分析：
+        text: `请对 PCAP 文件 ${pcapFileName}（user_id=${user_id}, session_id=${session_id}）进行总览分析：
 1. 整体流量模式（时间分布、流量峰值、主要通信方向）
 2. 唯一 IP 及其交互关系（客户端/服务端角色、内外网划分）
 3. 使用的协议与服务（端口、应用层协议识别）
@@ -2557,14 +2578,16 @@ server.prompt(
 server.prompt(
   'extract_credentials_prompt',
   {
-    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
+    pcapFileName: z.string().describe('待分析的 PCAP 文件名称（仅文件名），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID'),
+    session_id: z.string().describe('会话ID'),
   },
-  ({ pcapPath }) => ({
+  ({ pcapFileName, user_id, session_id }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `请分析 PCAP 文件 ${pcapPath} 中可能存在的凭据泄露：
+        text: `请分析 PCAP 文件 ${pcapFileName}（user_id=${user_id}, session_id=${session_id}）中可能存在的凭据泄露：
 1. 检查明文凭据（HTTP Basic Auth、FTP USER/PASS、Telnet 登录）
 2. 识别 Kerberos 认证尝试（AS-REQ/AS-REP/TGS-REQ，提取用户名与域）
 3. 提取哈希凭据（如 $krb5pa$、$krb5asrep$ 格式，并给出 hashcat 破解模式）
@@ -2577,15 +2600,17 @@ server.prompt(
 server.prompt(
   'analyze_l4_network_prompt',
   {
-    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
+    pcapFileName: z.string().describe('待分析的 PCAP 文件名称（仅文件名），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID'),
+    session_id: z.string().describe('会话ID'),
     tsharkArgs: z.string().optional().describe('可选的 tshark 过滤参数，例如：-Y "ip.addr == 10.0.0.1"'),
   },
-  ({ pcapPath, tsharkArgs = '' }) => ({
+  ({ pcapFileName, user_id, session_id, tsharkArgs = '' }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `请对 PCAP 文件 ${pcapPath} 进行传输层（四层）网络问题分析，重点解读 analyze_l4_network 返回的 JSON 报告：
+        text: `请对 PCAP 文件 ${pcapFileName}（user_id=${user_id}, session_id=${session_id}）进行传输层（四层）网络问题分析，重点解读 analyze_l4_network 返回的 JSON 报告：
 1. 逐流检查 TCP 连接建立：SYN 无响应、端口未开放（RST 拒绝）、SYN/SYN-ACK 重传
 2. 传输可靠性问题：超时重传、重复 ACK、零窗口（区分已恢复/未恢复）
 3. 异常断开：异常 RST（未正常挥手）、四次挥手不完整
@@ -2602,15 +2627,17 @@ ${tsharkArgs ? `建议使用的过滤参数: ${tsharkArgs}` : '未指定过滤�
 server.prompt(
   'analyze_l7_network_prompt',
   {
-    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
+    pcapFileName: z.string().describe('待分析的 PCAP 文件名称（仅文件名），例如：demo.pcap'),
+    user_id: z.string().describe('用户ID'),
+    session_id: z.string().describe('会话ID'),
     tsharkArgs: z.string().optional().describe('可选的 tshark 过滤参数，例如：-Y "http"'),
   },
-  ({ pcapPath, tsharkArgs = '' }) => ({
+  ({ pcapFileName, user_id, session_id, tsharkArgs = '' }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `请对 PCAP 文件 ${pcapPath} 进行应用层（七层）网络问题分析，重点解读 analyze_l7_network 返回的 JSON 报告：
+        text: `请对 PCAP 文件 ${pcapFileName}（user_id=${user_id}, session_id=${session_id}）进行应用层（七层）网络问题分析，重点解读 analyze_l7_network 返回的 JSON 报告：
 1. HTTP 错误：4xx 客户端错误、5xx 服务端错误，统计状态码分布
 2. 重定向循环：同一流内连续 ≥3 次 3xx 响应
 3. 响应极慢：请求到响应时间差 > 30s 的慢响应
@@ -2628,15 +2655,17 @@ ${tsharkArgs ? `建议使用的过滤参数: ${tsharkArgs}` : '未指定过滤�
 server.prompt(
   'analyze_ssl_tls_prompt',
   {
-    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
-    sslKeylogPath: z.string().describe('SSLKEYLOGFILE 文件路径（NSS Key Log 格式），例如：./sslkeylog.txt'),
+    pcapFileName: z.string().describe('待分析的 PCAP 文件名称（仅文件名），例如：demo.pcap'),
+    keylogFileName: z.string().describe('SSLKEYLOGFILE 文件名称（仅文件名），例如：sslkeylog.txt'),
+    user_id: z.string().describe('用户ID'),
+    session_id: z.string().describe('会话ID'),
   },
-  ({ pcapPath, sslKeylogPath }) => ({
+  ({ pcapFileName, keylogFileName, user_id, session_id }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `请对 PCAP 文件 ${pcapPath} 进行 SSL/TLS 解密分析（密钥文件 ${sslKeylogPath}），重点解读 analyze_ssl_tls 返回的 JSON 报告：
+        text: `请对 PCAP 文件 ${pcapFileName}（密钥文件 ${keylogFileName}, user_id=${user_id}, session_id=${session_id}）进行 SSL/TLS 解密分析，重点解读 analyze_ssl_tls 返回的 JSON 报告：
 
 【TLS 握手安全】
 1. 弱版本：TLS 1.0/1.1 已弃用、TLS 1.2 建议升级 1.3

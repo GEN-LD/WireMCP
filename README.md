@@ -7,10 +7,8 @@ WireMCP is a Model Context Protocol (MCP) server designed to empower Large Langu
 # Features
 WireMCP exposes the following tools to MCP clients, enhancing LLM understanding of network activity:
 
-- **`capture_packets`**: Captures live traffic and returns raw packet data as JSON, enabling LLMs to analyze packet-level details (e.g., IP addresses, ports, HTTP methods).
 - **`get_summary_stats`**: Provides protocol hierarchy statistics, giving LLMs an overview of traffic composition (e.g., TCP vs. UDP usage).
 - **`get_conversations`**: Delivers TCP/UDP conversation statistics, allowing LLMs to track communication flows between endpoints.
-- **`check_threats`**: Captures IPs and checks them against the URLhaus blacklist, equipping LLMs with threat intelligence context for identifying malicious activity.
 - **`check_ip_threats`**: Performs targeted threat intelligence lookups for specific IP addresses against multiple threat feeds, providing detailed reputation and threat data.
 - **`analyze_pcap`**: Analyzes PCAP files to provide comprehensive packet data in JSON format, enabling detailed post-capture analysis of network traffic.
 - **`extract_credentials`**: Scans PCAP files for potential credentials from various protocols (HTTP Basic Auth, FTP, Telnet), aiding in security audits and forensic analysis.
@@ -18,7 +16,7 @@ WireMCP exposes the following tools to MCP clients, enhancing LLM understanding 
 
 ## How It Helps LLMs
 WireMCP bridges the gap between raw network data and LLM comprehension by:
-- **Contextualizing Traffic**: Converts live packet captures into structured outputs (JSON, stats) that LLMs can parse and reason about.
+- **Contextualizing Traffic**: Converts PCAP traffic data into structured outputs (JSON, stats) that LLMs can parse and reason about.
 - **Threat Detection**: Integrates IOCs (currently URLhaus) to flag suspicious IPs, enhancing LLM-driven security analysis.
 - **Diagnostics**: Offers detailed traffic insights, enabling LLMs to assist with troubleshooting or identifying anomalies.
 - **Narrative Generation**: LLM's can Transform complex packet captures into coherent stories, making network analysis accessible to non-technical users.
@@ -78,17 +76,6 @@ Edit `mcp.json` in Cursor -> Settings -> MCP :
 This MCP will work well with any client. Use the command `node /path/to/WireMCP/index.js` in their MCP server settings.
 
 # Example Output
-
-Running `check_threats` might yield:
-
-```
-Captured IPs:
-174.67.0.227
-52.196.136.253
-
-Threat check against URLhaus blacklist:
-No threats detected in URLhaus blacklist.
-```
 
 Running `analyze_pcap` on a capture file:
 

@@ -9,7 +9,6 @@ const which = require('which');
 const fs = require('fs').promises;
 const crypto = require('crypto');
 const path = require('path');
-const os = require('os');
 // 【安全修复】将 promisify 的底层从 exec 改为 execFile，保证所有调用点使用安全的参数传递方式
 const execFileAsync = promisify(execFile);
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
@@ -25,29 +24,6 @@ console.log = (...args) => console.error(...args);
 
 // 【安全修复】输入白名单校验函数，防止攻击者通过恶意输入构造 shell 注入载荷
 // 在所有使用用户输入调用系统命令之前，必须先经过这些校验函数
-
-/**
- * 校验网络接口名称
- * 仅允许字母、数字、下划线、连字符、点号，长度不超过 64 字符
- * 阻止如 "eth0; whoami" 这类包含 shell 元字符的注入尝试
- */
-function validateInterface(name) {
-  if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(name)) {
-    throw new Error(`非法的网络接口名称: "${name}"。仅允许字母、数字、下划线、连字符和点号。`);
-  }
-  return name;
-}
-
-/**
- * 校验捕获时长
- * 仅允许 1~60 之间的整数，防止注入如 "5; cat /etc/passwd" 的非数字字符串
- */
-function validateDuration(d) {
-  if (!Number.isInteger(d) || d < 1 || d > 60) {
-    throw new Error(`捕获时长必须是 1~60 之间的整数，当前值: ${d}`);
-  }
-  return d;
-}
 
 /**
  * 校验 pcap 文件路径
@@ -410,13 +386,6 @@ function validateTsharkArgs(args) {
   }
 }
 
-/** * 生成安全的临时文件路径
- * 使用 os.tmpdir() + 唯一文件名，避免硬编码文件名被猜到或产生冲突
- */
-function createTempPcapPath() {
-  return path.join(os.tmpdir(), `wiremcp_${crypto.randomUUID()}.pcap`);
-}
-
 // Dynamically locate tshark
 async function findTshark() {
   try {
@@ -445,66 +414,6 @@ async function findTshark() {
 
 // Register tools with the given server instance
 function registerTools(server) {
-  // Tool 1: Capture live packet data
-  server.tool(
-  'capture_packets',
-  'Capture live traffic and provide raw packet data as JSON for LLM analysis',
-  {
-    interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
-    duration: z.number().optional().default(5).describe('Capture duration in seconds'),
-  },
-  async (args) => {
-    try {
-      const tsharkPath = await findTshark();
-      const { interface, duration } = args;
-      // 【安全修复】对用户输入的 interface 和 duration 进行白名单校验，阻止 shell 注入
-      validateInterface(interface);
-      validateDuration(duration);
-      // 【安全修复】使用安全的临时文件路径，避免硬编码文件名被利用
-      const tempPcap = createTempPcapPath();
-      console.error(`Capturing packets on ${interface} for ${duration}s`);
-
-      // 【安全修复】使用 execFileAsync + 参数数组替代 execAsync + 字符串拼接
-      // execFile 不经过系统 shell，参数直接传递给 tshark 进程，阻断注入路径
-      await execFileAsync(
-        tsharkPath,
-        ['-i', interface, '-w', tempPcap, '-a', `duration:${duration}`],
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
-
-      const { stdout, stderr } = await execFileAsync(
-        tsharkPath,
-        ['-r', tempPcap, '-T', 'json', '-e', 'frame.number', '-e', 'ip.src', '-e', 'ip.dst', '-e', 'tcp.srcport', '-e', 'tcp.dstport', '-e', 'tcp.flags', '-e', 'frame.time', '-e', 'http.request.method', '-e', 'http.response.code'],
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
-      if (stderr) console.error(`tshark stderr: ${stderr}`);
-      let packets = JSON.parse(stdout);
-
-      const maxChars = 720000;
-      let jsonString = JSON.stringify(packets);
-      if (jsonString.length > maxChars) {
-        const trimFactor = maxChars / jsonString.length;
-        const trimCount = Math.floor(packets.length * trimFactor);
-        packets = packets.slice(0, trimCount);
-        jsonString = JSON.stringify(packets);
-        console.error(`Trimmed packets from ${packets.length} to ${trimCount} to fit ${maxChars} chars`);
-      }
-
-      await fs.unlink(tempPcap).catch(err => console.error(`Failed to delete ${tempPcap}: ${err.message}`));
-
-      return {
-        content: [{
-          type: 'text',
-          text: `Captured packet data (JSON for LLM analysis):\n${jsonString}`,
-        }],
-      };
-    } catch (error) {
-      console.error(`Error in capture_packets: ${error.message}`);
-      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
-    }
-  }
-);
-
 // Tool 2: Analyze a PCAP file and provide protocol hierarchy statistics
 server.tool(
   'get_summary_stats',
@@ -583,80 +492,6 @@ server.tool(
       };
     } catch (error) {
       console.error(`Error in get_conversations: ${error.message}`);
-      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
-    }
-  }
-);
-
-// Tool 4: Capture traffic and check threats against URLhaus
-server.tool(
-  'check_threats',
-  'Capture live traffic and check IPs against URLhaus blacklist',
-  {
-    interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
-    duration: z.number().optional().default(5).describe('Capture duration in seconds'),
-  },
-  async (args) => {
-    try {
-      const tsharkPath = await findTshark();
-      const { interface, duration } = args;
-      // 【安全修复】白名单校验用户输入，防止命令注入
-      validateInterface(interface);
-      validateDuration(duration);
-      const tempPcap = createTempPcapPath();
-      console.error(`Capturing traffic on ${interface} for ${duration}s to check threats`);
-
-      // 【安全修复】使用 execFileAsync 参数数组方式调用，绕过 shell 解析
-      await execFileAsync(
-        tsharkPath,
-        ['-i', interface, '-w', tempPcap, '-a', `duration:${duration}`],
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
-
-      const { stdout } = await execFileAsync(
-        tsharkPath,
-        ['-r', tempPcap, '-T', 'fields', '-e', 'ip.src', '-e', 'ip.dst'],
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
-      const ips = [...new Set(stdout.split('\n').flatMap(line => line.split('\t')).filter(ip => ip && ip !== 'unknown'))];
-      console.error(`Captured ${ips.length} unique IPs: ${ips.join(', ')}`);
-
-      const urlhausUrl = 'https://urlhaus.abuse.ch/downloads/text/';
-      console.error(`Fetching URLhaus blacklist from ${urlhausUrl}`);
-      let urlhausData;
-      let urlhausThreats = [];
-      try {
-        const response = await axios.get(urlhausUrl);
-        console.error(`URLhaus response status: ${response.status}, length: ${response.data.length} chars`);
-        console.error(`URLhaus raw data (first 200 chars): ${response.data.slice(0, 200)}`);
-        const ipRegex = /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/;
-        urlhausData = [...new Set(response.data.split('\n')
-          .map(line => {
-            const match = line.match(ipRegex);
-            return match ? match[0] : null;
-          })
-          .filter(ip => ip))];
-        console.error(`URLhaus lookup successful: ${urlhausData.length} blacklist IPs fetched`);
-        console.error(`Sample URLhaus IPs: ${urlhausData.slice(0, 5).join(', ') || 'None'}`);
-        urlhausThreats = ips.filter(ip => urlhausData.includes(ip));
-        console.error(`Checked IPs against URLhaus: ${urlhausThreats.length} threats found - ${urlhausThreats.join(', ') || 'None'}`);
-      } catch (e) {
-        console.error(`Failed to fetch URLhaus data: ${e.message}`);
-        urlhausData = [];
-      }
-
-      const outputText = `Captured IPs:\n${ips.join('\n')}\n\n` +
-        `Threat check against URLhaus blacklist:\n${
-          urlhausThreats.length > 0 ? `Potential threats: ${urlhausThreats.join(', ')}` : 'No threats detected in URLhaus blacklist.'
-        }`;
-
-      await fs.unlink(tempPcap).catch(err => console.error(`Failed to delete ${tempPcap}: ${err.message}`));
-
-      return {
-        content: [{ type: 'text', text: outputText }],
-      };
-    } catch (error) {
-      console.error(`Error in check_threats: ${error.message}`);
       return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
     }
   }
@@ -2595,43 +2430,21 @@ server.tool(
 // Register prompts with the given server instance
 function registerPrompts(server) {
   // Add prompts for each tool
-  server.prompt(
-  'capture_packets_prompt',
-  {
-    interface: z.string().optional().describe('Network interface to capture from'),
-    duration: z.number().optional().describe('Duration in seconds to capture'),
-  },
-  ({ interface = 'en0', duration = 5 }) => ({
-    messages: [{
-      role: 'user',
-      content: {
-        type: 'text',
-        text: `Please analyze the network traffic on interface ${interface} for ${duration} seconds and provide insights about:
-1. The types of traffic observed
-2. Any notable patterns or anomalies
-3. Key IP addresses and ports involved
-4. Potential security concerns`
-      }
-    }]
-  })
-);
-
 server.prompt(
   'summary_stats_prompt',
   {
-    interface: z.string().optional().describe('Network interface to capture from'),
-    duration: z.number().optional().describe('Duration in seconds to capture'),
+    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
   },
-  ({ interface = 'en0', duration = 5 }) => ({
+  ({ pcapPath }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `Please provide a summary of network traffic statistics from interface ${interface} over ${duration} seconds, focusing on:
-1. Protocol distribution
-2. Traffic volume by protocol
-3. Notable patterns in protocol usage
-4. Potential network health indicators`
+        text: `请分析 PCAP 文件 ${pcapPath} 的协议层级统计，重点关注：
+1. 各协议占比与流量分布（tcp/udp/http/dns/tls 等的包数与字节数）
+2. 异常协议组合或非预期协议（如明文 telnet、可疑 C2 协议）
+3. 占比突出的协议是否反映业务特征或异常行为
+4. 结合协议层级分布给出整体网络健康度评估与排查建议`
       }
     }]
   })
@@ -2640,40 +2453,18 @@ server.prompt(
 server.prompt(
   'conversations_prompt',
   {
-    interface: z.string().optional().describe('Network interface to capture from'),
-    duration: z.number().optional().describe('Duration in seconds to capture'),
+    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
   },
-  ({ interface = 'en0', duration = 5 }) => ({
+  ({ pcapPath }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `Please analyze network conversations on interface ${interface} for ${duration} seconds and identify:
-1. Most active IP pairs
-2. Conversation durations and data volumes
-3. Unusual communication patterns
-4. Potential indicators of network issues`
-      }
-    }]
-  })
-);
-
-server.prompt(
-  'check_threats_prompt',
-  {
-    interface: z.string().optional().describe('Network interface to capture from'),
-    duration: z.number().optional().describe('Duration in seconds to capture'),
-  },
-  ({ interface = 'en0', duration = 5 }) => ({
-    messages: [{
-      role: 'user',
-      content: {
-        type: 'text',
-        text: `Please analyze traffic on interface ${interface} for ${duration} seconds and check for security threats:
-1. Compare captured IPs against URLhaus blacklist
-2. Identify potential malicious activity
-3. Highlight any concerning patterns
-4. Provide security recommendations`
+        text: `请分析 PCAP 文件 ${pcapPath} 的 TCP 会话统计，重点关注：
+1. 最活跃的 IP 通信对（按包数/字节数排序）
+2. 会话时长与数据量分布，识别长连接或大流量会话
+3. 异常通信模式（非标准端口、扫描行为、单向流量等）
+4. 潜在网络问题线索（如大量短连接、重连、异常外联）`
       }
     }]
   })
@@ -2682,18 +2473,18 @@ server.prompt(
 server.prompt(
   'check_ip_threats_prompt',
   {
-    ip: z.string().describe('IP address to check'),
+    ip: z.string().describe('待查询的 IP 地址，例如：192.168.1.1'),
   },
   ({ ip }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `Please analyze the following IP address (${ip}) for potential security threats:
-1. Check against URLhaus blacklist
-2. Evaluate the IP's reputation
-3. Identify any known malicious activity
-4. Provide security recommendations`
+        text: `请针对 IP 地址 ${ip} 进行威胁情报分析：
+1. 与 URLhaus 黑名单比对，判断是否为已知恶意 IP
+2. 评估该 IP 的信誉情况（结合返回结果说明）
+3. 如命中黑名单，推测可能关联的恶意行为（恶意软件分发、C2 等）
+4. 给出安全处置建议（封禁、加白、进一步取证等）`
       }
     }]
   })
@@ -2745,19 +2536,19 @@ ${tsharkArgs ? `推荐使用的参数: ${tsharkArgs}` : ''}`
 server.prompt(
   'analyze_pcap_prompt',
   {
-    pcapPath: z.string().describe('Path to the PCAP file'),
+    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
   },
   ({ pcapPath }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `Please analyze the PCAP file at ${pcapPath} and provide insights about:
-1. Overall traffic patterns
-2. Unique IPs and their interactions
-3. Protocols and services used
-4. Notable events or anomalies
-5. Potential security concerns`
+        text: `请对 PCAP 文件 ${pcapPath} 进行总览分析：
+1. 整体流量模式（时间分布、流量峰值、主要通信方向）
+2. 唯一 IP 及其交互关系（客户端/服务端角色、内外网划分）
+3. 使用的协议与服务（端口、应用层协议识别）
+4. 值得关注的事件或异常（扫描、爆破、非标准端口、明文敏感数据）
+5. 潜在安全风险与下一步深入分析建议`
       }
     }]
   })
@@ -2766,18 +2557,100 @@ server.prompt(
 server.prompt(
   'extract_credentials_prompt',
   {
-    pcapPath: z.string().describe('Path to the PCAP file'),
+    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
   },
   ({ pcapPath }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `Please analyze the PCAP file at ${pcapPath} for potential credential exposure:
-1. Look for plaintext credentials (HTTP Basic Auth, FTP, Telnet)
-2. Identify Kerberos authentication attempts
-3. Extract any hashed credentials
-4. Provide security recommendations for credential handling`
+        text: `请分析 PCAP 文件 ${pcapPath} 中可能存在的凭据泄露：
+1. 检查明文凭据（HTTP Basic Auth、FTP USER/PASS、Telnet 登录）
+2. 识别 Kerberos 认证尝试（AS-REQ/AS-REP/TGS-REQ，提取用户名与域）
+3. 提取哈希凭据（如 $krb5pa$、$krb5asrep$ 格式，并给出 hashcat 破解模式）
+4. 给出凭据处置与加固建议（禁用弱协议、改密、启用加密、审计等）`
+      }
+    }]
+  })
+);
+
+server.prompt(
+  'analyze_l4_network_prompt',
+  {
+    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
+    tsharkArgs: z.string().optional().describe('可选的 tshark 过滤参数，例如：-Y "ip.addr == 10.0.0.1"'),
+  },
+  ({ pcapPath, tsharkArgs = '' }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `请对 PCAP 文件 ${pcapPath} 进行传输层（四层）网络问题分析，重点解读 analyze_l4_network 返回的 JSON 报告：
+1. 逐流检查 TCP 连接建立：SYN 无响应、端口未开放（RST 拒绝）、SYN/SYN-ACK 重传
+2. 传输可靠性问题：超时重传、重复 ACK、零窗口（区分已恢复/未恢复）
+3. 异常断开：异常 RST（未正常挥手）、四次挥手不完整
+4. 攻击检测：SYN Flood（大量 SYN 无响应流 + 源 IP 分布）
+5. 注意单向流量场景：仅单向捕获时部分检测会跳过，需说明影响
+6. 结合 severity（critical/high/medium/low）给出处置优先级建议
+
+${tsharkArgs ? `建议使用的过滤参数: ${tsharkArgs}` : '未指定过滤参数时，将对命中的全部 TCP 流进行分析。'}`
+      }
+    }]
+  })
+);
+
+server.prompt(
+  'analyze_l7_network_prompt',
+  {
+    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
+    tsharkArgs: z.string().optional().describe('可选的 tshark 过滤参数，例如：-Y "http"'),
+  },
+  ({ pcapPath, tsharkArgs = '' }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `请对 PCAP 文件 ${pcapPath} 进行应用层（七层）网络问题分析，重点解读 analyze_l7_network 返回的 JSON 报告：
+1. HTTP 错误：4xx 客户端错误、5xx 服务端错误，统计状态码分布
+2. 重定向循环：同一流内连续 ≥3 次 3xx 响应
+3. 响应极慢：请求到响应时间差 > 30s 的慢响应
+4. 响应体完整性：声明 Content-Length 但存在重传 + 服务端 FIN，可能截断
+5. 服务端提前 FIN / 请求无响应：服务端未响应完毕就关闭连接，或无 FIN 无响应
+6. DNS 问题：NXDOMAIN、SERVFAIL、REFUSED、查询超时（有查询无响应）
+7. TLS 解密相关提示：基于 TLS 的请求若服务端有加密应用数据但未解密，会提示而非误报
+
+${tsharkArgs ? `建议使用的过滤参数: ${tsharkArgs}` : '未指定过滤参数时，将对命中的全部 TCP 流与 DNS 事务进行分析。'}`
+      }
+    }]
+  })
+);
+
+server.prompt(
+  'analyze_ssl_tls_prompt',
+  {
+    pcapPath: z.string().describe('待分析的 PCAP 文件路径，例如：./demo.pcap'),
+    sslKeylogPath: z.string().describe('SSLKEYLOGFILE 文件路径（NSS Key Log 格式），例如：./sslkeylog.txt'),
+  },
+  ({ pcapPath, sslKeylogPath }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `请对 PCAP 文件 ${pcapPath} 进行 SSL/TLS 解密分析（密钥文件 ${sslKeylogPath}），重点解读 analyze_ssl_tls 返回的 JSON 报告：
+
+【TLS 握手安全】
+1. 弱版本：TLS 1.0/1.1 已弃用、TLS 1.2 建议升级 1.3
+2. 弱密码套件：RC4、DES、3DES、NULL、EXPORT、匿名套件等
+3. SNI 缺失：Client Hello 未携带 SNI
+4. 握手失败：有 Client Hello 无 Server Hello
+
+【解密后 HTTP 明文】
+5. 请求行为：方法/URI/Host/User-Agent 统计，Top URI 频次
+6. 响应摘要：状态码、Content-Type、响应体摘要
+7. HTTP 问题：4xx/5xx、重定向循环、响应过慢
+8. 解密校验：若存在 TLS 流但解密后请求数为 0，提示密钥可能不匹配
+
+请分别给出 TLS 加固建议与 HTTP 层处置建议。`
       }
     }]
   })

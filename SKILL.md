@@ -10,13 +10,12 @@ WireMCP 是一个基于 MCP（Model Context Protocol）协议的网络流量分�
 
 | 能力域 | 说明 |
 |---|---|
-| 实时抓包 | 捕获指定网络接口的实时流量 |
 | PCAP 离线分析 | 对已有 PCAP 文件进行协议统计、会话分析、数据包解析 |
 | 传输层问题诊断 | 检测 TCP 层的 SYN 丢包、RST 异常、重传、零窗口等问题 |
 | 应用层问题诊断 | 检测 HTTP 4xx/5xx 错误、重定向循环、响应超时、DNS 失败等 |
 | TLS 解密分析 | 利用 SSLKEYLOGFILE 解密 TLS 流量，检测弱版本/弱密码，分析明文 HTTP 内容 |
 | 凭据提取 | 从 PCAP 中提取 HTTP Basic Auth、FTP、Telnet 明文凭据及 Kerberos 哈希 |
-| 威胁情报 | 实时抓包或指定 IP 与 URLhaus 黑名单比对 |
+| 威胁情报 | 指定 IP 与 URLhaus 黑名单比对 |
 | 自定义 tshark 命令 | 当内置工具不满足需求时，执行任意 tshark 过滤/提取命令 |
 
 ### 1.2 适用场景
@@ -25,7 +24,7 @@ WireMCP 是一个基于 MCP（Model Context Protocol）协议的网络流量分�
 - **安全分析**：凭据泄露检测、恶意 IP 识别、TLS 弱配置审计
 - **流量取证**：PCAP 文件离线分析、协议分布统计、会话还原
 - **CTF / 安全竞赛**：流量包分析、flag 提取、隐藏通信检测
-- **运维监控**：实时抓包 + 威胁情报联动
+- **运维监控**：PCAP 取证 + 威胁情报联动
 
 ---
 
@@ -132,7 +131,7 @@ Accept: application/json, text/event-stream
 
 ```
 event: message
-data: {"result":{"tools":[{"name":"capture_packets","description":"Capture live traffic...","inputSchema":{...}},...]}},"jsonrpc":"2.0","id":"list-1"}
+data: {"result":{"tools":[{"name":"analyze_pcap","description":"Analyze a PCAP file...","inputSchema":{...}},...]}},"jsonrpc":"2.0","id":"list-1"}
 ```
 
 返回的 `tools` 数组中每个元素包含：
@@ -168,36 +167,6 @@ data: {"result":{"content":[{"type":"text","text":"Error: tshark not found"}],"i
 ---
 
 ## 4. 工具详解
-
-### 4.1 capture_packets — 实时抓包
-
-| 属性 | 值 |
-|---|---|
-| 名称 | `capture_packets` |
-| 功能 | 在指定网络接口上捕获实时流量，返回结构化 JSON 数据包列表 |
-| 调用时机 | 需要观察当前网络实时流量时；无 PCAP 文件、需现场取证时 |
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|---|---|---|---|---|
-| `interface` | string | 否 | `"en0"` | 网络接口名（如 `eth0`、`en0`、`Wi-Fi`） |
-| `duration` | number | 否 | `5` | 捕获时长，1~60 秒整数 |
-
-**调用示例**：
-
-```
-POST /mcp HTTP/1.1
-Host: localhost:10001
-Content-Type: application/json
-Accept: application/json, text/event-stream
-
-{"jsonrpc":"2.0","id":"cap-1","method":"tools/call","params":{"name":"capture_packets","arguments":{"interface":"eth0","duration":10}}}
-```
-
-**返回内容**：JSON 格式的数据包数组，包含帧号、源/目的 IP、源/目的端口、TCP 标志、时间戳、HTTP 方法/状态码等字段。输出超过 720KB 时自动截断。
-
----
 
 ### 4.2 analyze_pcap — PCAP 通用分析
 
@@ -410,36 +379,6 @@ Accept: application/json, text/event-stream
 
 ---
 
-### 4.9 check_threats — 实时抓包 + 威胁情报
-
-| 属性 | 值 |
-|---|---|
-| 名称 | `check_threats` |
-| 功能 | 实时抓包提取 IP 地址，与 URLhaus 黑名单比对，识别恶意 IP |
-| 调用时机 | 需要检查当前网络中是否存在与恶意服务器通信的行为；实时威胁监控 |
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|---|---|---|---|---|
-| `interface` | string | 否 | `"en0"` | 网络接口名 |
-| `duration` | number | 否 | `5` | 捕获时长（1~60 秒） |
-
-**调用示例**：
-
-```
-POST /mcp HTTP/1.1
-Host: localhost:10001
-Content-Type: application/json
-Accept: application/json, text/event-stream
-
-{"jsonrpc":"2.0","id":"threat-1","method":"tools/call","params":{"name":"check_threats","arguments":{"interface":"eth0","duration":15}}}
-```
-
-**返回内容**：捕获到的所有 IP 列表 + URLhaus 黑名单匹配结果。
-
----
-
 ### 4.10 check_ip_threats — 单 IP 威胁查询
 
 | 属性 | 值 |
@@ -539,11 +478,7 @@ Accept: application/json, text/event-stream
 
 ```
 有 PCAP 文件吗？
-├── 否 → 需要实时抓包？
-│         ├── 是 → 需要威胁检测？
-│         │       ├── 是 → check_threats（抓包 + URLhaus 比对）
-│         │       └── 否 → capture_packets（纯抓包）
-│         └── 否 → 已有可疑 IP？→ check_ip_threats
+├── 否 → 已有可疑 IP？→ check_ip_threats（IP 威胁查询）
 │
 └── 是 → 第一步：analyze_pcap（快速概览）
           │
@@ -639,26 +574,6 @@ Accept: application/json, text/event-stream
 {"jsonrpc":"2.0","id":"wf3-3","method":"tools/call","params":{"name":"exec_tshark","arguments":{"pcapPath":"D:/ctf/challenge.pcap","tsharkArgs":"-T fields -e http.request.uri -Y \"http.request.uri contains \\\"flag\\\"\""}}}
 ```
 
-### 6.4 场景：实时威胁监控
-
-```
-# 1. 抓包 15 秒 + URLhaus 比对
-POST /mcp HTTP/1.1
-Host: localhost:10001
-Content-Type: application/json
-Accept: application/json, text/event-stream
-
-{"jsonrpc":"2.0","id":"wf4-1","method":"tools/call","params":{"name":"check_threats","arguments":{"interface":"eth0","duration":15}}}
-
-# 2. 对命中 IP 做二次确认
-POST /mcp HTTP/1.1
-Host: localhost:10001
-Content-Type: application/json
-Accept: application/json, text/event-stream
-
-{"jsonrpc":"2.0","id":"wf4-2","method":"tools/call","params":{"name":"check_ip_threats","arguments":{"ip":"185.220.101.45"}}}
-```
-
 ### 6.5 场景：并发连接问题诊断
 
 ```
@@ -718,8 +633,6 @@ Accept: application/json, text/event-stream
 | `tshark not found` | 系统未安装 Wireshark/tshark | 安装 Wireshark 并确保 tshark 在 PATH 中 |
 | `非法的文件路径` | 路径包含 `..` 或空字符 | 使用安全的绝对路径或相对路径 |
 | `不支持的文件扩展名` | 非 `.pcap`/`.pcapng`/`.cap` 文件 | 确保文件格式正确 |
-| `非法的网络接口名称` | 接口名包含特殊字符 | 使用合法接口名（仅字母/数字/下划线/连字符/点号） |
-| `捕获时长必须是 1~60 之间的整数` | duration 参数越界 | 传入 1~60 的整数 |
 
 ---
 
@@ -727,4 +640,3 @@ Accept: application/json, text/event-stream
 
 - **Node.js** >= 18
 - **Wireshark/tshark**：必须安装并在 PATH 中可访问
-- **网络权限**：实时抓包工具（`capture_packets`、`check_threats`）需要 root/Administrator 权限运行 tshark
